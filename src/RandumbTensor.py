@@ -187,6 +187,8 @@ def materialize_fwd_kernel(out_ptr,    # ptr to output vector
     offs_n = pid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     mask = offs_n < N
     
+    fp32scalefactor = tl.sqrt(M / 3.0)
+    
     # iterate along M-dim. These aren't "true" blocks in the sense that computation for blocks is split between pids, all chunks of computation here
     # are done in the same pid/block, this is more like "phases" within a single block, beacuse we require value of the entire vector to compute the dot product.
     accumulator = tl.zeros((BLOCK_SIZE_N, 1), dtype=tl.float32)
@@ -204,8 +206,8 @@ def materialize_fwd_kernel(out_ptr,    # ptr to output vector
         coefs = tl.load(coef_ptr + offs_m, mask=mask_M)[None, :]  # [1, BLOCK_SIZE_M]
         
         # dot product via broadcast of elementwise multiplication of coeffs across N-dim of materialized noise matrix
-        # followed by summation along M-dim
-        accumulator += tl.sum(mangledBits * coefs, axis=1)[:, None]  # [1, BLOCK_SIZE_N]
+        # followed by summation along M-dim with normalization
+        accumulator += tl.sum(mangledBits * coefs, axis=1)[:, None] / fp32scalefactor  # [1, BLOCK_SIZE_N]
         
     tl.store(out_ptr + offs_n[:, None], accumulator, mask=mask[:, None])
 
@@ -237,6 +239,8 @@ def materialize_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
     offs_m = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     mask = offs_m < M
     
+    fp32scalefactor = tl.sqrt(M / 3.0)
+    
     # iterate along N-dim (of the "transposed" noise matrix)
     accumulator = tl.zeros((BLOCK_SIZE_M, 1), dtype=tl.float32)
     for n in range(0, tl.cdiv(N, BLOCK_SIZE_N)):
@@ -253,8 +257,8 @@ def materialize_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
         dout = tl.load(dout_ptr + offs_n, mask=mask_N)[None, :]  # [1, BLOCK_SIZE_N]
         
         # dot product via broadcast of elementwise multiplication of dout across M-dim of materialized noise matrix
-        # followed by summation along N-dim
-        accumulator += tl.sum(mangledBits * dout, axis=1)[:, None]  # [1, BLOCK_SIZE_M]
+        # followed by summation along N-dim with normalization
+        accumulator += tl.sum(mangledBits * dout, axis=1)[:, None] / fp32scalefactor # [1, BLOCK_SIZE_M]
         
     tl.store(dcoef_ptr + offs_m[:, None], accumulator, mask=mask[:, None])
 
@@ -444,7 +448,7 @@ class RandumbTensorConstructor(Function):
 
     @staticmethod
     def backward(ctx, grad):
-        # print(f"backward pass called with grad {grad}")
+        print(f"backward pass called with grad {grad}")
         # flatten the grad back to same shape as materialize bwd output
         grad = grad.view(-1)
         # run the actual bwd

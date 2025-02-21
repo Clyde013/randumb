@@ -18,6 +18,13 @@ It is easy to see how the utilization of a PRNG noise function instead of more t
 Most naive SGEMV operations are memory-bound, so one can additionally balance the memory-compute bandwidth requirements of the PMV by adjusting the size of the coefficient dimension.
 For further details on the custom kernel implementation, check out the code directly, as well as an attached diagram under `readme_src/materialization_algo.png` to illustrate the algorithm.
 
+We also throw in a fused elementwise normalization factor by the std. to the final materialized tensor as the dot product between two independent uniform (a row of noise: x) and normal (coef: y) distributions will have variance of:
+```math
+\text{var}(x) = \frac{(b−a)^2}{12} = 1/3 \newline
+\text{var}(y) = 1 \newline
+\text{Since both X and Y have 0 mean:} \
+\text{var}(x \cdot y) = \sum^{d_y}_{i=1}{\text{var}(xy)} = \sum^{d_y}_{i=1}{\text{var}(x)\text{var}(y)} = \sum^{d_y}_{i=1}{\frac{1}{3}} = \frac{d_y}{3}
+```
 
 ## Requirements
 This repo uses triton==3.2.0 and pytorch>=2.6.0 for `torch.library.triton_op` support. Install with:

@@ -338,8 +338,8 @@ def check_train_loop():
     class SillyModel(nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.linear1 = nn.Linear(1, 36)
-            self.rt_linear = SillyLinear(36, 3, 15, 1337, False, device="cuda")
+            self.linear1 = nn.Linear(1, 5)
+            self.rt_linear = SillyLinear(5, 3, 15, 1337, False, device="cuda")
             
         def forward(self, x):
             x = F.relu(self.linear1(x))
@@ -396,6 +396,7 @@ def plot_dist():
     # plots the distributions of the 3 matrices involved in RandumbTensor, the final output, the noise matrix, and the coef matrix
     num_elems = 512
     inner_dim = 64
+    torch.manual_seed(32)
     rt_coef = torch.randn(inner_dim, requires_grad=True, device=DEVICE)
     rt = CreateRandumbTensor(rt_coef, 1337, (num_elems,))
     y = rt.get_materialized().cpu().detach().numpy()
@@ -443,6 +444,6 @@ if __name__ == "__main__":
     # benchmark_speed_materialize.run(print_data=True, show_plots=True, save_path='bench_out')
     # benchmark_speed_rt.run(print_data=True, show_plots=True, save_path='bench_out')
 
-    # check_train_loop()
-    plot_dist()
+    check_train_loop()
+    # plot_dist()
     
