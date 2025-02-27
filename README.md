@@ -21,8 +21,10 @@ For further details on the custom kernel implementation, check out the code dire
 When initializing the layers and their coef matrices, we need to manipulate the distribution of the coef matrix to ensure the output materialized matrix has appropriate std. or bounds (otherwise output and grads will explode).
 Under the simplifying constraints that *both noise and coef matrices have 0 mean*, the dot product between an independent uniform (a row of noise: x) and random (coef: y) distribution will have variance of:
 ```math
-\text{var}(x) = \frac{(b−a)^2}{12} = 1/3 \newline
-\text{var}(x \cdot y) = \sum^{d_y}_{i=1}{\text{var}(xy)} = \sum^{d_y}_{i=1}{\text{var}(x)\text{var}(y)} = \frac{d_y}{3}{\text{var}(y)}
+\begin{aligned}
+&\text{var}(x) = \frac{(b−a)^2}{12} = \frac{1}{3} \\
+& \text{var}(x \cdot y) = \sum^{d_y}_{i=1}{\text{var}(xy)} = \sum^{d_y}_{i=1}{\text{var}(x)\text{var}(y)} = \frac{d_y}{3}{\text{var}(y)}
+\end{aligned}
 ```
 Since the different initialization schemes under `nn.init` have varying requirements of the final output matrix's std., we must manipulate $\text{var}(y)$ such that the output var $\frac{d_y}{3}{\text{var}(y)}=std^2$. 
 Hence, $\text{var}(y)=\frac{3}{d_y}std^2$ where $d_y$ is the coef dim.
