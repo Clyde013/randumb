@@ -14,6 +14,8 @@ computation graph bwd functions with grad hooks, which was extremely inelegant a
 Note that the although not technically necessary materialize_fwd is registered as a pytorch function and works with autograd out of the box. 
 This is mostly a legacy feature from v1 implementation, but given that torch compile and triton have many undocumented bugs with torch.Function 
 composability I've kept it as is to prevent any unforseen bugs.
+
+Squirrel5 noise based prng generation implementation is adapted from http://eiserloh.net/noise/SquirrelNoise5.hpp.
 """
 
 from typing import Union
@@ -32,58 +34,41 @@ import triton.language as tl
 
 from torch.profiler import profile, record_function
 
-# the following is a standalone kernel implementation, used mainly for crosschecking correctness of the more complex implementations
-@triton.jit
-def squirrel5_kernel(x_ptr,	# pointer to output vector
-                     n,	# size of the vector
-                     BLOCK_SIZE: tl.constexpr,
-                     seed,	# seed for the tensor being generated
-                     pos,	# when generating 2d matrix by each column, this is the column number
-                     ):
 
-    # squirrel noise constants
-    SQ5_BIT_NOISE1: tl.constexpr = 0xd2a80a3f	# 11010010101010000000101000111111
-    SQ5_BIT_NOISE2: tl.constexpr = 0xa884f197	# 10101000100001001111000110010111
-    SQ5_BIT_NOISE3: tl.constexpr = 0x6C736F4B # 01101100011100110110111101001011
-    SQ5_BIT_NOISE4: tl.constexpr = 0xB79F3ABB	# 10110111100111110011101010111011
-    SQ5_BIT_NOISE5: tl.constexpr = 0x1b56c4f5	# 00011011010101101100010011110101
-    PRIME_NUMBER: tl.constexpr = 198491317 # Large prime number with non-boring bits
-    
+# the following is a standalone helper kernel implementation, used mainly for crosschecking correctness of the more complex implementations
+@triton.autotune(configs=[
+    triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 128}, num_warps=4),
+    ],
+    key=['N', 'M']
+)
+@triton.jit
+def squirrel5_kernel(out_ptr,    # ptr to output vector (N, M)
+                N, M,   # sizes of the vectors
+                seed,   # seed for the generated tensor
+                stride_n, stride_m,
+                BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_M: tl.constexpr):
+    """
+    Helper kernel materializing only the noise matrix (for debugging)
+    The out_ptr is the noise matrix of shape (N, M)
+    """
     # identifies correct memory address of the part of the output vector we are writing to
-    pid = tl.program_id(0)
-    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offs < n
+    pid_n = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    mask = (offs_n < N)[:, None] & (offs_m < M)[None, :]
     
     # squirrel5 noise function
-    # use PRIME_NUMBER to mix pos into single int for the noise function
-    mangledBits = offs.to(tl.int32) + (PRIME_NUMBER * pos)
-    mangledBits *= SQ5_BIT_NOISE1
-    mangledBits += seed
-    mangledBits ^= (mangledBits >> 9)
-    mangledBits += SQ5_BIT_NOISE2
-    mangledBits ^= (mangledBits >> 11)
-    mangledBits *= SQ5_BIT_NOISE3
-    mangledBits ^= (mangledBits >> 13)
-    mangledBits += SQ5_BIT_NOISE4
-    mangledBits ^= (mangledBits >> 15)
-    mangledBits *= SQ5_BIT_NOISE5 
-    mangledBits ^= (mangledBits >> 17)
+    mangledBits = squirrel5_gen(offs_m, offs_n, seed)   # [BLOCK_SIZE_N, BLOCK_SIZE_M]
+    out_ptrs = out_ptr + stride_n * offs_n[:, None] + stride_m * offs_m[None, :]
     
-    # rescale the noise vector between -1 and 1
-    ONE_OVER_MAX_INT: tl.constexpr = 1.0 / 0x7FFFFFFF
-    mangledBits = ( ONE_OVER_MAX_INT * mangledBits.to(tl.int32).to(tl.float32) ).to(tl.float32)
-    
-    tl.store(x_ptr + offs, mangledBits, mask=mask)
-     
-    #print_if(f'pid = {pid} | mangledBits = {mangledBits} | ONE_OVER_MAX_INT = {ONE_OVER_MAX_INT}', '')
+    tl.store(out_ptrs, mangledBits, mask=mask)
 
-def squirrel5_generate(row_num, size=300, BLOCK_SIZE=1024, seed=1337):
-    output = torch.empty(size=(size,), device='cuda')
-    n_elements = output.numel()
-    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )
-    squirrel5_kernel[grid](output, n_elements, BLOCK_SIZE=BLOCK_SIZE, seed=seed, pos=row_num)
+def squirrel5_generate(N, M, seed=1337):
+    output = torch.empty(size=(N, M), device='cuda')
+    grid = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE_N']), triton.cdiv(M, meta['BLOCK_SIZE_M']))
+    squirrel5_kernel[grid](output, N, M, seed, output.stride(0), output.stride(1))
     return output
-
 
 
 
@@ -104,7 +89,7 @@ def squirrel5_gen(cols: tl.tensor, rows: tl.tensor, seed):
     SQ5_BIT_NOISE5: tl.constexpr = 0x1b56c4f5	# 00011011010101101100010011110101
     PRIME_NUMBER: tl.constexpr = 198491317 # Large prime number with non-boring bits
     
-    mangledBits = (PRIME_NUMBER * rows)[:, None] + cols.to(tl.int32)[None, :]
+    mangledBits = (PRIME_NUMBER * rows.to(tl.uint32))[:, None] + cols.to(tl.uint32)[None, :]
     mangledBits *= SQ5_BIT_NOISE1
     mangledBits += seed
     mangledBits ^= (mangledBits >> 9)
@@ -119,7 +104,7 @@ def squirrel5_gen(cols: tl.tensor, rows: tl.tensor, seed):
     
     # rescale the noise vector between -1 and 1
     ONE_OVER_MAX_INT: tl.constexpr = 1.0 / 0x7FFFFFFF
-    mangledBits = ( ONE_OVER_MAX_INT * mangledBits.to(tl.int32).to(tl.float32) ).to(tl.float32)
+    mangledBits = ( ONE_OVER_MAX_INT * mangledBits.to(tl.int32).to(tl.float32) )
     return mangledBits
 
 @triton.jit
@@ -141,7 +126,7 @@ def squirrel5_gen_T(cols: tl.tensor, rows: tl.tensor, seed):
     SQ5_BIT_NOISE5: tl.constexpr = 0x1b56c4f5	# 00011011010101101100010011110101
     PRIME_NUMBER: tl.constexpr = 198491317 # Large prime number with non-boring bits
     
-    mangledBits = (PRIME_NUMBER * rows)[None, :] + cols.to(tl.int32)[:, None]
+    mangledBits = (PRIME_NUMBER * rows.to(tl.uint32))[None, :] + cols.to(tl.uint32)[:, None]
     mangledBits *= SQ5_BIT_NOISE1
     mangledBits += seed
     mangledBits ^= (mangledBits >> 9)
@@ -187,8 +172,6 @@ def materialize_fwd_kernel(out_ptr,    # ptr to output vector
     offs_n = pid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     mask = offs_n < N
     
-    fp32scalefactor = tl.sqrt(M / 3.0)
-    
     # iterate along M-dim. These aren't "true" blocks in the sense that computation for blocks is split between pids, all chunks of computation here
     # are done in the same pid/block, this is more like "phases" within a single block, beacuse we require value of the entire vector to compute the dot product.
     accumulator = tl.zeros((BLOCK_SIZE_N, 1), dtype=tl.float32)
@@ -206,8 +189,8 @@ def materialize_fwd_kernel(out_ptr,    # ptr to output vector
         coefs = tl.load(coef_ptr + offs_m, mask=mask_M)[None, :]  # [1, BLOCK_SIZE_M]
         
         # dot product via broadcast of elementwise multiplication of coeffs across N-dim of materialized noise matrix
-        # followed by summation along M-dim with normalization
-        accumulator += tl.sum(mangledBits * coefs, axis=1)[:, None] / fp32scalefactor  # [1, BLOCK_SIZE_N]
+        # followed by summation along M-dim
+        accumulator += tl.sum(mangledBits * coefs, axis=1)[:, None]  # [1, BLOCK_SIZE_N]
         
     tl.store(out_ptr + offs_n[:, None], accumulator, mask=mask[:, None])
 
@@ -239,8 +222,6 @@ def materialize_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
     offs_m = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     mask = offs_m < M
     
-    fp32scalefactor = tl.sqrt(M / 3.0)
-    
     # iterate along N-dim (of the "transposed" noise matrix)
     accumulator = tl.zeros((BLOCK_SIZE_M, 1), dtype=tl.float32)
     for n in range(0, tl.cdiv(N, BLOCK_SIZE_N)):
@@ -257,8 +238,8 @@ def materialize_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
         dout = tl.load(dout_ptr + offs_n, mask=mask_N)[None, :]  # [1, BLOCK_SIZE_N]
         
         # dot product via broadcast of elementwise multiplication of dout across M-dim of materialized noise matrix
-        # followed by summation along N-dim with normalization
-        accumulator += tl.sum(mangledBits * dout, axis=1)[:, None] / fp32scalefactor # [1, BLOCK_SIZE_M]
+        # followed by summation along N-dim
+        accumulator += tl.sum(mangledBits * dout, axis=1)[:, None] # [1, BLOCK_SIZE_M]
         
     tl.store(dcoef_ptr + offs_m[:, None], accumulator, mask=mask[:, None])
 
@@ -358,7 +339,7 @@ class RandumbTensor(torch.Tensor):
         with torch._C._DisableTorchDispatch():
             return f"RandumbTensor(seed={self.seed}, int_dim={self.int_dim}, shape={self.shape}, noise_matrix_shape={self.noise_matrix_shape}, dtype={self.dtype}, device='{self._coef.device}', coef={self._coef})"
     
-    def get_materialized(self):
+    def get_materialized(self) -> torch.Tensor:
         # helper function to materialize the full matrix, should only be used for debugging tbh, for all intents and purposes other than
         # printing the output tensor, just calling rt should suffice as the torch_dispatch override should materialize the matrix anyway
         self.materialize()
@@ -366,13 +347,9 @@ class RandumbTensor(torch.Tensor):
         self.dematerialize()
         return ref
     
-    #TODO: the distribution of the noise matrix and therefore final output tensor seems to be incredibly biased?
-    def get_noise_matrix(self):
+    def get_noise_matrix(self) -> torch.Tensor:
         # helper function to materialize the standalone noise matrix, should only be used for debugging
-        true_noise_mat = torch.zeros(self.noise_matrix_shape, device=self._coef.device)
-        for row in range(self.noise_matrix_shape[0]):
-            row_vals = squirrel5_generate(row, size=self.noise_matrix_shape[1], BLOCK_SIZE=256, seed=self.seed)
-            true_noise_mat[row] = row_vals
+        true_noise_mat = squirrel5_generate(*self.noise_matrix_shape, self.seed)
         return true_noise_mat
     
     def print_memory(self):
@@ -448,7 +425,6 @@ class RandumbTensorConstructor(Function):
 
     @staticmethod
     def backward(ctx, grad):
-        print(f"backward pass called with grad {grad}")
         # flatten the grad back to same shape as materialize bwd output
         grad = grad.view(-1)
         # run the actual bwd
@@ -512,10 +488,7 @@ if __name__ == "__main__":
     true_coef = w1.detach().clone().to(DEVICE)
     true_coef.requires_grad_()
     n, m = torch.Size(output_shape).numel(), true_coef.size(0)
-    true_noise_mat = torch.zeros((n, m), device=DEVICE, requires_grad=False)
-    for row in range(n):
-        row_vals = squirrel5_generate(row, size=m, BLOCK_SIZE=256, seed=seed)
-        true_noise_mat[row] = row_vals
+    true_noise_mat = squirrel5_generate(n, m, seed)
 
     true_rt = (true_noise_mat @ true_coef).view(output_shape)
     print(f"checking truert equal rt {torch.allclose(x, true_rt)}")

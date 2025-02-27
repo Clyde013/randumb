@@ -1,13 +1,16 @@
 # implements silly little custom nn.Modules for common pytorch layers, except the weights
 # are composed of RandumbTensors as their parameters.
 import math
+import warnings
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import init
+from torch.nn.init import _calculate_correct_fan, calculate_gain
+from torch import Generator
 
-from src.RandumbTensor import CreateRandumbTensor
+from src.RandumbTensor import CreateRandumbTensor, RandumbTensor
 
 
 class SillyLinear(nn.Module):
@@ -43,7 +46,7 @@ class SillyLinear(nn.Module):
     out_features: int
     int_dim: int
     seed: int
-    weight: torch.Tensor
+    weight: RandumbTensor
 
     def __init__(
         self,
@@ -63,29 +66,46 @@ class SillyLinear(nn.Module):
         
         self.weight_coef = nn.Parameter(torch.randn(int_dim, dtype=dtype, device=device), requires_grad=True)
         self.weight = CreateRandumbTensor(self.weight_coef, seed, (out_features, in_features))
-        # self.register_parameter("weight_coef", nn.Parameter(self.weight_coef))
+        
         if bias:
             self.bias_coef = nn.Parameter(torch.randn(int_dim, dtype=dtype, device=device), requires_grad=True)
             self.bias = CreateRandumbTensor(self.bias_coef, seed+1, (out_features, ))
-            #self.register_parameter("bias_coef", nn.Parameter(self.bias))
         else:
             self.bias = None
-            # self.register_parameter("bias_coef", None)
-        print(f"weight {self.weight.get_materialized()}")
-        print(f"weight noise {self.weight.get_noise_matrix()}")
+            
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         # Setting a=sqrt(5) in kaiming_uniform is the same as initializing with
         # uniform(-1/sqrt(in_features), 1/sqrt(in_features)). For details, see
         # https://github.com/pytorch/pytorch/issues/57109
-        return
-        init.kaiming_uniform_(self.weight._coef, a=math.sqrt(5))
+        tensor = self.weight._coef
+        a = math.sqrt(5)
+        nonlinearity: str = "relu"
+        generator = torch.Generator(device=tensor.device).manual_seed(self.seed)
+        if 0 in tensor.shape:
+            warnings.warn("Initializing zero-element tensors is a no-op")
+            return tensor
+
+        # this snippet is just `kaiming_uniform_`` https://github.com/pytorch/pytorch/blob/main/torch/nn/init.py#L456
+        fan_in = _calculate_correct_fan(self.weight, "fan_in")
+        gain = calculate_gain(nonlinearity, a)
+        # this is the "true" intended distribution of the final materialized matrix
+        out_std = gain / math.sqrt(fan_in)
+        
+        # $\text{var}(y)=\frac{3}{d_y}std^2$ where $d_y$ is the coef dim.
+        coef_std = math.sqrt(3/self.weight.int_dim)*out_std
+        bound = math.sqrt(3.0) * coef_std  # Calculate uniform bounds from standard deviation
+        with torch.no_grad():
+            tensor.uniform_(-bound, bound, generator=generator)
+            
+        # similar for bias
         if self.bias is not None:
-            fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            # this is probably not exactly correct bounds calculation but its close enough right?
-            init.uniform_(self.bias._coef, -bound, bound)
+            # as per nn.Linear implementation, we utilize fan_in and std computed from self.weight when initializing bias
+            bias_std = math.sqrt(3/self.bias.int_dim)*out_std
+            bound = math.sqrt(3.0) * bias_std  # Calculate uniform bounds from standard deviation
+            with torch.no_grad():
+                self.bias._coef.uniform_(-bound, bound, generator=generator)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return F.linear(input, self.weight, self.bias)

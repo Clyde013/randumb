@@ -8,6 +8,7 @@ from torchvision import datasets, transforms
 from torch.optim.lr_scheduler import StepLR
 from src.SillyLayers import SillyLinear
 
+from src.RandumbTensor import CreateRandumbTensor
 
 class Net(nn.Module):
     def __init__(self):
@@ -40,10 +41,18 @@ class SillyNet(nn.Module):
         super(SillyNet, self).__init__()
         self.conv1 = nn.Conv2d(1, 32, 3, 1)
         self.conv2 = nn.Conv2d(32, 64, 3, 1)
-        self.dropout1 = nn.Dropout(0.25)
-        self.dropout2 = nn.Dropout(0.5)
-        self.fc1 = SillyLinear(9216, 128, 64, 10, device="cuda")
-        self.fc2 = SillyLinear(128, 10, 32, 17, device="cuda")
+        #self.dropout1 = nn.Dropout(0.25)
+        #self.dropout2 = nn.Dropout(0.5)
+        self.dropout1 = nn.Dropout(0.025)
+        self.dropout2 = nn.Dropout(0.05)
+        self.fc1 = SillyLinear(9216, 128, int_dim=32, seed=14, device="cuda")
+        
+        # self.weight = rt.get_materialized()
+        # self.weight = torch.randn((128, 9216), device="cuda", requires_grad=True)
+        self.fc2 = SillyLinear(128, 10, int_dim=16, seed=20, device="cuda")
+        # self.fc2 = nn.Linear(128, 10, bias=False)
+        print(f"fc1 weight & bias: {self.fc1.weight} {self.fc1.bias}")
+        print(f"fc2 weight & bias: {self.fc2.weight} {self.fc2.bias}")
 
     def forward(self, x):
         x = self.conv1(x)
@@ -98,6 +107,8 @@ def test(model, device, test_loader):
 
 
 def main():
+    import lovely_tensors as lt
+    lt.monkey_patch()
     # Training settings
     parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
     parser.add_argument('--batch-size', type=int, default=64, metavar='N',
@@ -114,6 +125,7 @@ def main():
                         help='disables CUDA training')
     parser.add_argument('--no-mps', action='store_true', default=False,
                         help='disables macOS GPU training')
+    # note: dry-run default set to True for debugging, should be False
     parser.add_argument('--dry-run', action='store_true', default=False,
                         help='quickly check a single pass')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
@@ -165,7 +177,6 @@ def main():
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
     for epoch in range(1, args.epochs + 1):
-        print(model.fc1.weight_coef)
         train(args, model, device, train_loader, optimizer, epoch)
         test(model, device, test_loader)
         scheduler.step()
