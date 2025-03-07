@@ -20,6 +20,7 @@ Squirrel5 noise based prng generation implementation is adapted from http://eise
 
 from typing import Union
 from collections.abc import Iterable
+from functools import partial
 
 import torch
 from torch.utils._pytree import tree_map, tree_map_only
@@ -33,7 +34,7 @@ import triton
 import triton.language as tl
 
 from torch.profiler import profile, record_function
-
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 # the following is a standalone helper kernel implementation, used mainly for crosschecking correctness of the more complex implementations
 @triton.autotune(configs=[
@@ -287,21 +288,22 @@ class RandumbTensor(torch.Tensor):
     coefficient tensor. Tensor A has shape (n, int_dim). Tensor B has shape (int_dim,).
     The output tensor will be reshaped into an arbitrary shape where n is the number of elements.
     
-    This custom tensor subclass should be usable anywhere, however when utilising it inside nn.Module, it is
-    necessary to manually register the _coef tensor as a parameter of the module for any optimizers and stuff to work:
-    `self.register_parameter("coef", nn.Parameter(self.rt._coef))`
+    This custom tensor subclass should be usable anywhere, however when utilising it inside nn.Module, 
+    remember to register the _coef tensor as a parameter of the module for any optimizers and stuff to work.
     
     Do note that due to the nature of this tensor, device is expected to be 'cuda' upon initialization and basically all the time.
-    Set requires_grad=True at the start, do not reassign it post-init as this might break the subclass.
+    Always instantiate a RandumbTensor via the RandumbTensorConstructor, this ensures that the gradients will be properly backpropagated
+    to the coeficient tensor. 
     
-    Be aware there is a bug if you use device="cuda" in the __init__ pytorch will throw an error:
-    `RuntimeError: 0 <= device.index() && device.index() < static_cast<c10::DeviceIndex>(device_ready_queues_.size()) INTERNAL ASSERT FAILED at "/pytorch/torch/csrc/autograd/engine.cpp":1522, please report a bug to PyTorch.`
-    when it tries to call the backward pass. I have no clue why this happens, but it is likely related to the .to(..., *args, **kwargs) where one of the extra arguments is causing the coef tensor to map to an invalid device?
-    To prevent this, just init the tensor on CPU then use .to("cuda")
+    There is a slightly complicated "lazy" view materialization, it works by intercepting any torch_dispatch 
+    to view/transpose/etc. ops called on the RT, and returns another RT instance with the intercepted op appended to view_ops. 
+    During materialization, the view ops in view_ops are sequentially called again, but this also has overhead from recreating views every
+    call, making views of RTs magnitudes slower if comparing to normal tensor views, which are usually created once and then cached, 
+    so use sparingly and with caution. If possible, create with original shape and no view_ops applied to it.
     """
     
     @staticmethod
-    def __new__(cls, data: torch.Tensor, seed: int, shape: Union[tuple, torch.Size], requires_grad=False):
+    def __new__(cls, data: torch.Tensor, seed: int, shape: Union[tuple, torch.Size], requires_grad=False, view_ops: list = None):
         
         # Creating the wrapper will generally detach tensors from the autograd graph, ensure that the 
         # input does not require grad (should be taken care of by constructor Function)
@@ -309,11 +311,11 @@ class RandumbTensor(torch.Tensor):
         
         return torch.Tensor._make_wrapper_subclass(cls, torch.Size(shape), requires_grad=False)
 
-    def __init__(self, data: torch.Tensor, seed: int, shape: Union[tuple, torch.Size], requires_grad=False):
+    def __init__(self, data: torch.Tensor, seed: int, shape: Union[tuple, torch.Size], requires_grad=False, view_ops: list = []):
         """
         Args:
             data (torch.Tensor): If `int`, represents intermediate/intrinsic dimension, and random coef
-                tensor will be generated. If `Iterable`, will use that coefs as the coef tensor.
+                tensor will be generated. Can be nn.Parameter (expected for usage in Layers).
             seed (int): Seed for the prng generator
             shape (Union[tuple, torch.Size]): Final tensor output shape
             dtype (torch.dtype): dtype
@@ -334,6 +336,11 @@ class RandumbTensor(torch.Tensor):
         self._tensor: torch.Tensor = None
         # shape of the prng generated tensor (that should never be fully materialised)
         self.noise_matrix_shape = torch.Size((self.shape.numel(), self.int_dim))
+        
+        # sequence of view ops to apply to the materialized _tensor
+        self.view_ops = view_ops
+        # this should be overridden by any view_ops after init to maintain the original, unmodified shape for the first .view() operation in materialize()
+        self._init_shape = shape
     
     def __repr__(self):
         with torch._C._DisableTorchDispatch():
@@ -367,19 +374,29 @@ class RandumbTensor(torch.Tensor):
         # This should be outside the autograd computation graph already if ever called, but just in case we wrap it in torch.no_grad
         with torch.no_grad():
             # materializes the tensor, then reshape it appropriately. 
-            self._tensor = materialize_fwd(self._coef, self.noise_matrix_shape[0], self.seed).view(self.shape)
-    
+            self._tensor = materialize_fwd(self._coef, self.noise_matrix_shape[0], self.seed).view(self._init_shape)
+            
+            # view_ops application, for if RandumbTensor had view/transpose etc. called
+            for opset in self.view_ops:
+                op = opset[0]
+                # replace the RandumbTensor that is usually the first arg with self._tensor
+                args = opset[1][1:]
+                kwargs = opset[2]
+                # i don't understand it but, applying the torch_dispatch ops adds to the backwards graph of _tensor, which is convenient? 
+                # it doesn't seem to popualate the grad_fn here though... so i'm honestly not sure *where* the computation graph is being constructed,
+                # but it sure is exceptionally convenient for me!
+                with torch._C._DisableTorchDispatch():
+                    self._tensor = op(self._tensor, *args, **kwargs)
+                    
     def dematerialize(self):
         # this function should free _tensor from memory. We can safely delete the entire tensor because the autograd computation is tracked manually by the
         # wrapper creation Function.
         del self._tensor
         return
     
-    
     __torch_function__ = torch._C._disabled_torch_function_impl
-    #TODO: support .detach() returning a still wrapped RT, due to https://github.com/pytorch/pytorch/issues/77265#issuecomment-1129044684
-    # its supposed to be overridden in torch_dispatch, but we can check if its possible to override it in torch_function instead.
-    # this is so that it will work with nn.Parameter without pytorch shitting itself.
+    # list of view ops that we intercept in torch_dispatch, should be easy to add support for any listed https://pytorch.org/docs/stable/tensor_view.html
+    OVERRIDE_VIEW_OPS = [torch.ops.aten.view.default, torch.ops.aten.transpose.int]
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
         # keep track of all materialized tensors
@@ -393,8 +410,23 @@ class RandumbTensor(torch.Tensor):
                 return e
             
         # perform the operation with materialized tensors
-        # print(f"dispatched {func} {args} {kwargs}")
-        ret = func(*tree_map(_materialize, args), **tree_map(_materialize, kwargs))
+        if func in cls.OVERRIDE_VIEW_OPS:
+            instance: RandumbTensor = args[0]
+            # remember to deepcopy the list
+            view_ops = [i for i in instance.view_ops]
+            view_ops.append((func, args, kwargs))
+            with torch.no_grad():
+                # use faketensor to compute the final output shape, because we cannot change tensor.shape attribute once created, and if the output 
+                # shape doesn't match the grad that is returned in the bwd pass, then pytorch will throw an error.
+                with FakeTensorMode():
+                    fake = torch.empty(instance.shape)
+                    fake = func(fake, *args[1:], **kwargs)
+                rt = RandumbTensor(instance._coef, instance.seed, fake.shape, instance.requires_grad, view_ops)
+                rt._init_shape = instance._init_shape
+            return rt
+        else:
+            ret = func(*tree_map(_materialize, args), **tree_map(_materialize, kwargs))
+            
         
         # dematerialize all previously materialized tensors
         for t in materialized_tensors:
@@ -404,7 +436,7 @@ class RandumbTensor(torch.Tensor):
     
     # TODO: implement indexing and slicing like https://github.com/albanD/subclass_zoo/blob/ec47458346c2a1cfcd5e676926a4bbc6709ff62e/uint4_tensor.py#L89
     
-    
+
 class RandumbTensorConstructor(Function):
     """
     A differentiable function that constructs and returns a RandumbTensor given the coefs, seed and shape.
@@ -439,36 +471,64 @@ class RandumbTensorConstructor(Function):
 # alias for the constructor, use this as `rt = CreateRandumbTensor(...)`
 CreateRandumbTensor = RandumbTensorConstructor.apply
 
+def getBack(var_grad_fn):
+    print(var_grad_fn)
+    for n in var_grad_fn.next_functions:
+        if n[0]:
+            try:
+                tensor = getattr(n[0], 'variable')
+                print(n[0])
+                print('Tensor with grad found:', tensor)
+                print(' - gradient:', tensor.grad)
+                print()
+            except AttributeError as e:
+                getBack(n[0])
 
-if __name__ == "__main__":
-    
-    def getBack(var_grad_fn):
-        print(var_grad_fn)
-        for n in var_grad_fn.next_functions:
-            if n[0]:
-                try:
-                    tensor = getattr(n[0], 'variable')
-                    print(n[0])
-                    print('Tensor with grad found:', tensor)
-                    print(' - gradient:', tensor.grad)
-                    print()
-                except AttributeError as e:
-                    getBack(n[0])
+if __name__ == "__main__":    
+
                 
     torch.manual_seed(0)
     DEVICE = "cuda" 
     seed = 1337
     output_shape = (5, 10)
-    w1 = nn.Parameter(torch.randn(7, requires_grad=True, device=DEVICE))
-    w2 = torch.randn((10, 3), requires_grad=False, device=DEVICE)
+    w1 = nn.Parameter(torch.randn(7, device=DEVICE), requires_grad=True)
+    w2 = torch.randn((2, 3), requires_grad=False, device=DEVICE)
 
     # Autograd doesn't "unwrap" variables, they still remember if they
     # requires_grad; and in fact, inside __torch_dispatch__ it is willing
     # to mix gradients between multiple levels. The current class does
     # catch most of these though when it is looking at the different
     # arguments
-    x = CreateRandumbTensor(w1, seed, output_shape)
+    print("creating RT with view transpose")
+    x = CreateRandumbTensor(w1, seed, output_shape).view(2, 25).transpose(0, 1)
+    print("created RT with view transpose")
+    print(f"x {x.requires_grad} {x} {x.view_ops}")
+    """
     print(f"x {x}")
+    print(f"viewops {x.view_ops}")
+    
+    y1 = torch.zeros(5, 10, device=DEVICE)
+    print(x.add(y1))
+    
+    x2 = x.view(10, 5)
+    print(f"x2 {x2}")
+    print(f"viewops {x2.view_ops}")
+    
+    y2 = torch.zeros(10, 5, device=DEVICE)
+    print(x2.add(y2))
+    
+    x3 = x2.transpose(0, 1)
+    print(f"x3 {x3}")
+    z = x3.add(y1)
+    print(f"z {z}")
+    
+    print("--------------")
+    print("getting backwards graph of z.gradfn")
+    getBack(z.grad_fn)
+    print(f"x requires grad {x.requires_grad}")
+    print(f"x2 requires grad {x2.requires_grad}")
+    """
+    
     print("performing backward")
     # there are two different behaviours here. if the w2 is of a normal tensor, the grads are not backpropagated
     # to the inner tensors of the tensor subclass.
@@ -476,7 +536,8 @@ if __name__ == "__main__":
     for i in range(10):
         print(f"innerautograd backward {i}")
         y = x @ w2
-        y.sum().backward(retain_graph=True)
+        loss = y.sum()
+        loss.backward(retain_graph=True)
     print(w1.grad)
     print("x inner grads", x._coef.grad)
     
@@ -490,7 +551,7 @@ if __name__ == "__main__":
     n, m = torch.Size(output_shape).numel(), true_coef.size(0)
     true_noise_mat = squirrel5_generate(n, m, seed)
 
-    true_rt = (true_noise_mat @ true_coef).view(output_shape)
+    true_rt = (true_noise_mat @ true_coef).view(output_shape).view(2, 25).transpose(0, 1)
     print(f"checking truert equal rt {torch.allclose(x, true_rt)}")
     true_w2 = w2.detach().clone()
     for i in range(10):
@@ -499,4 +560,3 @@ if __name__ == "__main__":
         y.sum().backward(retain_graph=True)
     
     print(f"true coef grad {true_coef.grad}")
-    
