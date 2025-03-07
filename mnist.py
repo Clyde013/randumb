@@ -1,12 +1,14 @@
 # adapted from https://github.com/pytorch/examples/blob/main/mnist/main.py
 import argparse
+import matplotlib.pyplot as plt
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.optim.lr_scheduler import StepLR
-from src.SillyLayers import SillyLinear
+from src.SillyLayers import SillyLinear, SillyConv2d
 
 from src.RandumbTensor import CreateRandumbTensor
 
@@ -39,18 +41,18 @@ class Net(nn.Module):
 class SillyNet(nn.Module):
     def __init__(self):
         super(SillyNet, self).__init__()
-        self.conv1 = nn.Conv2d(1, 32, 3, 1)
-        self.conv2 = nn.Conv2d(32, 64, 3, 1)
-        #self.dropout1 = nn.Dropout(0.25)
-        #self.dropout2 = nn.Dropout(0.5)
-        self.dropout1 = nn.Dropout(0.025)
-        self.dropout2 = nn.Dropout(0.05)
-        self.fc1 = SillyLinear(9216, 128, int_dim=32, seed=14, device="cuda")
+        self.conv1 = SillyConv2d(1, 32, int_dim=64, seed=5, kernel_size=3, stride=1, device="cuda")
+        #self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, device="cuda")
+        self.conv2 = SillyConv2d(32, 64, int_dim=32, seed=9, kernel_size=3, stride=1, device="cuda")
+        # self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, device="cuda")
+        self.dropout1 = nn.Dropout(0.25)
+        self.dropout2 = nn.Dropout(0.5)
         
-        # self.weight = rt.get_materialized()
-        # self.weight = torch.randn((128, 9216), device="cuda", requires_grad=True)
-        self.fc2 = SillyLinear(128, 10, int_dim=16, seed=20, device="cuda")
-        # self.fc2 = nn.Linear(128, 10, bias=False)
+        # self.fc1 = nn.Linear(9216, 128)
+        self.fc1 = SillyLinear(9216, 128, int_dim=128, seed=14, device="cuda")
+        
+        # self.fc2 = nn.Linear(128, 10)
+        self.fc2 = SillyLinear(128, 10, int_dim=64, seed=20, device="cuda")
         print(f"fc1 weight & bias: {self.fc1.weight} {self.fc1.bias}")
         print(f"fc2 weight & bias: {self.fc2.weight} {self.fc2.bias}")
 
@@ -70,7 +72,7 @@ class SillyNet(nn.Module):
         return output
 
 
-def train(args, model, device, train_loader, optimizer, epoch):
+def train(args, model, device, train_loader, optimizer, epoch, train_losses):
     model.train()
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
@@ -83,11 +85,12 @@ def train(args, model, device, train_loader, optimizer, epoch):
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
                 100. * batch_idx / len(train_loader), loss.item()))
+            train_losses.append(loss.detach().item())
             if args.dry_run:
                 break
 
 
-def test(model, device, test_loader):
+def test(model, device, test_loader, test_accs):
     model.eval()
     test_loss = 0
     correct = 0
@@ -100,7 +103,7 @@ def test(model, device, test_loader):
             correct += pred.eq(target.view_as(pred)).sum().item()
 
     test_loss /= len(test_loader.dataset)
-
+    test_accs.append(100. * correct / len(test_loader.dataset))
     print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
@@ -176,10 +179,20 @@ def main():
     optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
+    train_losses = []
+    test_accs = []
     for epoch in range(1, args.epochs + 1):
-        train(args, model, device, train_loader, optimizer, epoch)
-        test(model, device, test_loader)
+        train(args, model, device, train_loader, optimizer, epoch, train_losses)
+        test(model, device, test_loader, test_accs)
         scheduler.step()
+
+    fig, axs = plt.subplots(2)
+    fig.suptitle(f'mnist train results, final acc {test_accs[-1]}%')
+    axs[0].plot(train_losses)
+    axs[0].set_title("train loss")
+    axs[1].plot(test_accs)
+    axs[1].set_title("eval test accs")
+    fig.savefig('bench_out/mnist.png')
 
     if args.save_model:
         torch.save(model.state_dict(), "mnist_cnn.pt")
