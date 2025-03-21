@@ -8,9 +8,9 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.optim.lr_scheduler import StepLR
-from src.SillyLayers import SillyLinear, SillyConv2d
+from src.SillyLayers import SillyLinear, SillyConv2d, stepgen
 
-from src.RandumbTensor import CreateRandumbTensor
+from src.RandumbTensor import CreateRandumbTensor, getBack
 
 class Net(nn.Module):
     def __init__(self):
@@ -37,24 +37,31 @@ class Net(nn.Module):
         output = F.log_softmax(x, dim=1)
         return output
 
+class CastedLinear(SillyLinear):
 
+    def __init__(self, in_features, out_features, int_dim_gen, seed_gen):
+        super().__init__(in_features, out_features, int_dim_gen, seed_gen, bias=False)
+
+    def forward(self, x):
+        return F.linear(x, self.weight.to(x.dtype))
+    
 class SillyNet(nn.Module):
-    def __init__(self):
+    def __init__(self, int_dim_gen, seed_gen):
         super(SillyNet, self).__init__()
-        self.conv1 = SillyConv2d(1, 32, int_dim=64, seed=5, kernel_size=3, stride=1, device="cuda")
+        self.conv1 = SillyConv2d(1, 32, int_dim=int_dim_gen, seed=seed_gen, kernel_size=3, stride=1)
         #self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, device="cuda")
-        self.conv2 = SillyConv2d(32, 64, int_dim=32, seed=9, kernel_size=3, stride=1, device="cuda")
+        self.conv2 = SillyConv2d(32, 64, int_dim=int_dim_gen, seed=seed_gen, kernel_size=3, stride=1)
         # self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, device="cuda")
         self.dropout1 = nn.Dropout(0.25)
         self.dropout2 = nn.Dropout(0.5)
         
         # self.fc1 = nn.Linear(9216, 128)
-        self.fc1 = SillyLinear(9216, 128, int_dim=128, seed=14, device="cuda")
+        self.fc1 = CastedLinear(9216, 128, int_dim_gen=int_dim_gen, seed_gen=seed_gen)
         
         # self.fc2 = nn.Linear(128, 10)
-        self.fc2 = SillyLinear(128, 10, int_dim=64, seed=20, device="cuda")
-        print(f"fc1 weight & bias: {self.fc1.weight} {self.fc1.bias}")
-        print(f"fc2 weight & bias: {self.fc2.weight} {self.fc2.bias}")
+        self.fc2 = SillyLinear(128, 10, int_dim=int_dim_gen, seed=seed_gen)
+        print(f"fc1 weight & bias: {self.fc1.weight} {self.fc1.weight.grad_fn} {self.fc1.bias}")
+        print(f"fc2 weight & bias: {self.fc2.weight} {self.fc2.weight.grad_fn} {self.fc2.bias}")
 
     def forward(self, x):
         x = self.conv1(x)
@@ -74,13 +81,21 @@ class SillyNet(nn.Module):
 
 def train(args, model, device, train_loader, optimizer, epoch, train_losses):
     model.train()
+    train_accumulation_steps = 4
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
         output = model(data)
         loss = F.nll_loss(output, target)
         loss.backward()
-        optimizer.step()
+        
+        if batch_idx % train_accumulation_steps == 0:
+            print(f"train accum steps reached for {batch_idx}")
+            for p in model.parameters():
+                print(f"p grad {p.grad.dtype} {p}")
+                p.grad /= train_accumulation_steps
+                
+            optimizer.step()
         if batch_idx % args.log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
@@ -92,7 +107,7 @@ def train(args, model, device, train_loader, optimizer, epoch, train_losses):
 
 def test(model, device, test_loader, test_accs):
     model.eval()
-    test_loss = 0
+    test_loss = 0 
     correct = 0
     with torch.no_grad():
         for data, target in test_loader:
@@ -161,7 +176,8 @@ def main():
 
     transform=transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
+        transforms.Normalize((0.1307,), (0.3081,)),
+        transforms.ConvertImageDtype(torch.bfloat16)
         ])
     dataset1 = datasets.MNIST('../data', train=True, download=True,
                        transform=transform)
@@ -170,12 +186,25 @@ def main():
     train_loader = torch.utils.data.DataLoader(dataset1,**train_kwargs)
     test_loader = torch.utils.data.DataLoader(dataset2, **test_kwargs)
 
-    model = SillyNet().to(device)
+    # generators for int_dim and seed
+    int_dim_gen = stepgen(128, 0)
+    seed_gen = stepgen(5, 4)
+
+    model = SillyNet(int_dim_gen, seed_gen)
+    model = model.cuda().bfloat16()
+    for m in model.modules():
+        if isinstance(m, CastedLinear):
+            # m.to(torch.float32)
+            m.float()
     # model = Net().to(device)
+    # model = torch.compile(model)
     print("parameters optimized:")
     for name, param in model.named_parameters():
         if param.requires_grad:
-            print(name)
+            print(name, param.device, param.dtype)
+    for buf in model.buffers():
+        print(type(buf), buf.size(), buf.device)
+
     optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)

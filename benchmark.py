@@ -187,9 +187,9 @@ def check_func():
         x_vals=[2**i for i in range(2, 17, 1)],  # Different possible values for `size`.
         x_log=True,  # x axis is logarithmic.
         line_arg='provider',  # Argument name whose value corresponds to a different line in the plot.
-        line_vals=['torch', 'rt'],  # Possible values for `line_arg`.
-        line_names=['torch', 'rt'],  # Label name for the lines.
-        styles=[('green', '-'), ('blue', '-')],  # Line styles.
+        line_vals=['torch', 'rt', 'torch_view', 'rt_view'],  # Possible values for `line_arg`.
+        line_names=['torch', 'rt', 'torch_view', 'rt_view'],  # Label name for the lines.
+        styles=[('green', '-'), ('blue', '-'), ('red', '-'), ('purple', '-')],  # Line styles.
         ylabel='ms',  # Label name for the y-axis.
         plot_name='torch vs RT speed performance',  # Name for the plot. Used also as a file name for saving the plot.
         args={},  # Values for function arguments not in `x_names` and `y_name`.
@@ -206,9 +206,11 @@ def benchmark_speed_rt(size, provider):
     
     rt_coef = torch.randn(m, requires_grad=True, device=DEVICE)
     rt = CreateRandumbTensor(rt_coef, 1337, x_shape)
+    rt_viewed = rt.view(-1, 8, 2)
     
     t = torch.randn(x_shape, device=DEVICE)
     mat1 = torch.randn(size, 4, 4, device=DEVICE)
+    mat2 = mat1.view(-1, 2, 8)
     
     def rt_impl():
         rt @ mat1
@@ -218,12 +220,26 @@ def benchmark_speed_rt(size, provider):
         t @ mat1
         return
 
+    def rt_view_impl():
+        rt_viewed @ mat2
+        return
+    
+    def torch_view_impl():
+        # for fair comparison, since the RT applies view ops every time it's called, we call view op here instead of caching it
+        t.view(-1, 8, 2) @ mat2
+        return
     
     if provider == 'torch':
         ms, min_ms, max_ms = triton.testing.do_bench(torch_impl, quantiles=quantiles)
         
     if provider == 'rt':
         ms, min_ms, max_ms = triton.testing.do_bench(rt_impl, quantiles=quantiles)
+        
+    if provider == 'torch_view':
+        ms, min_ms, max_ms = triton.testing.do_bench(torch_view_impl, quantiles=quantiles)
+        
+    if provider == 'rt_view':
+        ms, min_ms, max_ms = triton.testing.do_bench(rt_view_impl, quantiles=quantiles)
         
     return ms, max_ms, min_ms
 
@@ -334,21 +350,31 @@ def warmup():
 
 
 def check_train_loop():
+    
+    def print_grad_hook(module, grad_input, grad_output):
+        print(f"bwd grad hook {module} {grad_input} {grad_output}")
         
+    def print_grad_tensor_hook(t):
+        print(f"bwd grad hook on tensor {t.grad}")
+    
     class SillyModel(nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.linear1 = nn.Linear(1, 5)
             self.rt_linear = SillyLinear(5, 3, 15, 1337, False, device="cuda")
+            self.linear1.register_full_backward_hook(print_grad_hook)
+            self.rt_linear.register_full_backward_hook(print_grad_hook)
+            self.rt_linear.weight._coef.register_post_accumulate_grad_hook(print_grad_tensor_hook)
             
         def forward(self, x):
             x = F.relu(self.linear1(x))
             x = self.rt_linear(x)
+            print(f"fwd out: {x}")
             return x
     
     # Create Tensors to hold input and outputs.
     x = torch.linspace(-math.pi, math.pi, 2000).view(2000, 1).to(DEVICE)
-    y = torch.sin(x).to(DEVICE)
+    y = y.to(DEVICE)
 
     # Construct our model by instantiating the class defined above
     model = SillyModel().to(DEVICE)
@@ -373,8 +399,10 @@ def check_train_loop():
             print(t, loss.item())
 
         # Zero gradients, perform a backward pass, and update the weights.
-        getBack(loss.grad_fn)
+        # getBack(loss.grad_fn)
         optimizer.zero_grad()
+        print(f"loop {t} loss {loss}: out {y_pred} true {y}")
+        print("bwd called")
         loss.backward()
         optimizer.step()
 
@@ -394,14 +422,37 @@ def getBack(var_grad_fn):
 
 def plot_dist():
     # plots the distributions of the 3 matrices involved in RandumbTensor, the final output, the noise matrix, and the coef matrix
-    num_elems = 512
+    import lovely_tensors as lt
+    lt.monkey_patch()
+    
+    """
+    out_shape = (128, 9216)
     inner_dim = 64
-    torch.manual_seed(32)
-    rt_coef = torch.randn(inner_dim, requires_grad=True, device=DEVICE)
-    rt = CreateRandumbTensor(rt_coef, 1337, (num_elems,))
-    y = rt.get_materialized().cpu().detach().numpy()
-    noise = rt.get_noise_matrix().cpu().detach().numpy().flatten()
+    torch.manual_seed(20)
+    rt_coef = nn.Parameter(torch.randn(inner_dim, requires_grad=True, device=DEVICE), requires_grad=True)
+    rt = CreateRandumbTensor(rt_coef, 1337, out_shape)
+    """
+    
+    # rtlinear = SillyLinear(9216, 128, int_dim=64, seed=14, device="cuda")
+    rtlinear = SillyLinear(128, 64, int_dim=64, seed=14, device="cuda")
+    rt = rtlinear.weight
+    rt_coef = rtlinear.weight._coef
+    
+    y = rt.get_materialized()
+    noise = rt.get_noise_matrix()
+    print(f"rt materialized: {y.deeper()}")
+    print(f"noise: {noise.v}")
+    y = y.cpu().detach().numpy().flatten()
+    
+    noise = noise.cpu().detach().numpy()
+    fig, ax = plt.subplots(1)
+    ax.imshow(noise[:150], cmap='hot', interpolation='nearest')
+    fig.savefig('dists/noise_heatmap.png')
+    noise = noise.flatten()
+    
     coef = rt_coef.cpu().detach().numpy()
+    
+    print("plotting")
     
     fig, axs = plt.subplots(3)
     fig.suptitle('materialized matrix distribution')
@@ -412,10 +463,11 @@ def plot_dist():
     
     fig, axs = plt.subplots(3)
     fig.suptitle('noise matrix distribution')
-    axs[0].hist(noise, bins='auto')
+    axs[0].hist(noise, bins=20)
     axs[1].scatter(noise, range(noise.size))
     axs[2].plot(np.sort(noise))
     fig.savefig('dists/noise_distribution.png')
+    
     
     fig, axs = plt.subplots(3)
     fig.suptitle('coefs distribution')
@@ -442,8 +494,8 @@ if __name__ == "__main__":
     # benchmarks the speed and memory consumption
     # benchmark_mem_materialize.run(print_data=True, show_plots=True, save_path='bench_out')
     # benchmark_speed_materialize.run(print_data=True, show_plots=True, save_path='bench_out')
-    # benchmark_speed_rt.run(print_data=True, show_plots=True, save_path='bench_out')
+    benchmark_speed_rt.run(print_data=True, show_plots=True, save_path='bench_out')
 
-    check_train_loop()
-    # plot_dist()
+    # check_train_loop()
+    plot_dist()
     

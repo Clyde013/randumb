@@ -20,7 +20,11 @@ Squirrel5 noise based prng generation implementation is adapted from http://eise
 
 from typing import Union
 from collections.abc import Iterable
-from functools import partial
+import sys
+import referrers
+import warnings
+import os
+os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 
 import torch
 from torch.utils._pytree import tree_map, tree_map_only
@@ -35,6 +39,7 @@ import triton.language as tl
 
 from torch.profiler import profile, record_function
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch._guards import detect_fake_mode
 
 # the following is a standalone helper kernel implementation, used mainly for crosschecking correctness of the more complex implementations
 @triton.autotune(configs=[
@@ -145,15 +150,19 @@ def squirrel5_gen_T(cols: tl.tensor, rows: tl.tensor, seed):
     mangledBits = ( ONE_OVER_MAX_INT * mangledBits.to(tl.int32).to(tl.float32) ).to(tl.float32)
     return mangledBits
 
+# kernel configs for both materialize fwd and bwd
+kernel_cfgs = [
+    triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 4}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_M': 4}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_SIZE_N': 1024, 'BLOCK_SIZE_M': 4}, num_warps=4),
+    # triton.Config(kwargs={'BLOCK_SIZE_N': 16, 'BLOCK_SIZE_M': 16}, num_warps=4),
+    # triton.Config(kwargs={'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_M': 16}, num_warps=4),
+    # triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 16}, num_warps=4),
+    # triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 128}, num_warps=4),
+]
 
-@triton.autotune(configs=[
-    triton.Config(kwargs={'BLOCK_SIZE_N': 16, 'BLOCK_SIZE_M': 16}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_M': 16}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 16}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 128}, num_warps=4),
-  ],
-  key=['N', 'M']
-)
+
+@triton.autotune(configs=kernel_cfgs, key=['N', 'M'])
 @triton.jit
 def materialize_fwd_kernel(out_ptr,    # ptr to output vector
                 coef_ptr,  # ptr to the coefficients vector
@@ -196,14 +205,7 @@ def materialize_fwd_kernel(out_ptr,    # ptr to output vector
     tl.store(out_ptr + offs_n[:, None], accumulator, mask=mask[:, None])
 
 
-@triton.autotune(configs=[
-    triton.Config(kwargs={'BLOCK_SIZE_N': 16, 'BLOCK_SIZE_M': 16}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_M': 16}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 16}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 128}, num_warps=4),
-  ],
-  key=['N', 'M']
-)
+@triton.autotune(configs=kernel_cfgs, key=['N', 'M'])
 @triton.jit
 def materialize_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
                 dout_ptr,  # ptr to the dout vector
@@ -215,8 +217,8 @@ def materialize_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
     Since the noise matrix is transposed, the dims of it are (m, n) instead.
     given the eqn: noise @ coef = out |   (n, m) @ (m, 1) = (n, 1)
     dcoef = noise.T @ dout    |   (m, 1) = (m, n) @ (n, 1)
-    it should be possible to generate the transpose of the noise matrix and fuse the matmul somehow
-    making the backward pass for this function almost the exact same time complexity as the forward pass.
+    we generate the transpose of the noise matrix and fuse the matmul, making the backward pass for this function 
+    almost the exact same time complexity as the forward pass.
     """
     # identifies correct memory address of the part of the dcoef vector we are writing to
     pid = tl.program_id(0)
@@ -283,15 +285,15 @@ def _bwd(dout: torch.Tensor, dcoefs_size: int, seed: int):
 
 class RandumbTensor(torch.Tensor):
     """
-    This is a structured tensor representation that is constructed via the fused matmul of 
-    two tensors, tensor A that is generated via prng function and tensor B, a trainable
-    coefficient tensor. Tensor A has shape (n, int_dim). Tensor B has shape (int_dim,).
+    This is a structured tensor representation that is constructed via the fused matmul of two tensors, tensor A that is generated 
+    via prng function and tensor B, a trainable coefficient tensor. Tensor A has shape (n, int_dim). Tensor B has shape (int_dim,).
     The output tensor will be reshaped into an arbitrary shape where n is the number of elements.
     
-    This custom tensor subclass should be usable anywhere, however when utilising it inside nn.Module, 
-    remember to register the _coef tensor as a parameter of the module for any optimizers and stuff to work.
+    This custom tensor subclass should be usable anywhere, however when utilising it inside nn.Module, remember to register
+    the _coef tensor as a parameter of the module, and the RandumbTensor itself as a buffer via `register_buffer` for any
+    optimizers and stuff like `.to(device)` to work.
     
-    Do note that due to the nature of this tensor, device is expected to be 'cuda' upon initialization and basically all the time.
+    Do note that due to the nature of this tensor, device is expected to be the same device as _coef tensor, and when used should be 'cuda:{whatever_gpu}'.
     Always instantiate a RandumbTensor via the RandumbTensorConstructor, this ensures that the gradients will be properly backpropagated
     to the coeficient tensor. 
     
@@ -300,18 +302,23 @@ class RandumbTensor(torch.Tensor):
     During materialization, the view ops in view_ops are sequentially called again, but this also has overhead from recreating views every
     call, making views of RTs magnitudes slower if comparing to normal tensor views, which are usually created once and then cached, 
     so use sparingly and with caution. If possible, create with original shape and no view_ops applied to it.
+    
+    While coef will work with bfloat16, float16 and float32, and the variable of self.dtype follows the coef.dtype, take note that
+    the final output of the materialization kernel will be upcasted to float32. If .to() is utilized to cast the output dtype, then it will be added to view_ops.
+    
+    Integration with torch compile is not supported, there is no guarantee that torch compile will not create a model with a memory leak
+    due to it compiling a graph that holds references to _tensor - this is the case for the modded-nanogpt implementation. 
+    However torch compile might still work for simpler models such as mnist, so use at your own risk.
     """
     
     @staticmethod
-    def __new__(cls, data: torch.Tensor, seed: int, shape: Union[tuple, torch.Size], requires_grad=False, view_ops: list = None):
-        
+    def __new__(cls, data: torch.Tensor, seed: int, shape: Union[tuple, torch.Size], view_ops: list = None):
         # Creating the wrapper will generally detach tensors from the autograd graph, ensure that the 
-        # input does not require grad (should be taken care of by constructor Function)
+        # input does not require grad or not created inside autograd context (should be taken care of by constructor Function)
         assert not data.requires_grad or not torch.is_grad_enabled()
-        
-        return torch.Tensor._make_wrapper_subclass(cls, torch.Size(shape), requires_grad=False)
+        return torch.Tensor._make_wrapper_subclass(cls, torch.Size(shape), device=data.device, dtype=data.dtype, requires_grad=False)
 
-    def __init__(self, data: torch.Tensor, seed: int, shape: Union[tuple, torch.Size], requires_grad=False, view_ops: list = []):
+    def __init__(self, data: torch.Tensor, seed: int, shape: Union[tuple, torch.Size], view_ops: list = []):
         """
         Args:
             data (torch.Tensor): If `int`, represents intermediate/intrinsic dimension, and random coef
@@ -344,7 +351,7 @@ class RandumbTensor(torch.Tensor):
     
     def __repr__(self):
         with torch._C._DisableTorchDispatch():
-            return f"RandumbTensor(seed={self.seed}, int_dim={self.int_dim}, shape={self.shape}, noise_matrix_shape={self.noise_matrix_shape}, dtype={self.dtype}, device='{self._coef.device}', coef={self._coef})"
+            return f"RandumbTensor(seed={self.seed}, int_dim={self.int_dim}, shape={self.shape}, noise_matrix_shape={self.noise_matrix_shape}, dtype={self.dtype}, device='{self.device}', coef={self._coef})"
     
     def get_materialized(self) -> torch.Tensor:
         # helper function to materialize the full matrix, should only be used for debugging tbh, for all intents and purposes other than
@@ -369,12 +376,14 @@ class RandumbTensor(torch.Tensor):
         print(f"unmaterialized noise matrix: {noise_mem}MiB\ncoefficient matrix: {coeff_mem}MiB\noutput matrix: {out_mem}MiB")
         print(f"% 'saved' memory: {noise_mem / total_mem * 100}%")
         return
-        
+    
+    # disable torch compile as it causes some extremely funky bugs where _tensor does not exist
+    @torch.compiler.disable(recursive=False)
     def materialize(self):
         # This should be outside the autograd computation graph already if ever called, but just in case we wrap it in torch.no_grad
         with torch.no_grad():
             # materializes the tensor, then reshape it appropriately. 
-            self._tensor = materialize_fwd(self._coef, self.noise_matrix_shape[0], self.seed).view(self._init_shape)
+            self._tensor = materialize_fwd(self._coef, self.noise_matrix_shape[0], self.seed).to(self.dtype).view(self._init_shape)
             
             # view_ops application, for if RandumbTensor had view/transpose etc. called
             for opset in self.view_ops:
@@ -383,20 +392,30 @@ class RandumbTensor(torch.Tensor):
                 args = opset[1][1:]
                 kwargs = opset[2]
                 # i don't understand it but, applying the torch_dispatch ops adds to the backwards graph of _tensor, which is convenient? 
-                # it doesn't seem to popualate the grad_fn here though... so i'm honestly not sure *where* the computation graph is being constructed,
+                # it doesn't seem to populate the grad_fn here though... so i'm honestly not sure *where* the computation graph is being constructed,
                 # but it sure is exceptionally convenient for me!
                 with torch._C._DisableTorchDispatch():
                     self._tensor = op(self._tensor, *args, **kwargs)
-                    
+
     def dematerialize(self):
         # this function should free _tensor from memory. We can safely delete the entire tensor because the autograd computation is tracked manually by the
         # wrapper creation Function.
+        
+        # if memory leak suspected, uncomment. Otherwise keep commented as it causes torch.compile to graph break (if you are using it)
+        """
+        if sys.getrefcount(self._tensor) > 2: 
+            # ref count should be 2 - self._tensor variable itself and the globals() dict. be aware that torch.compile'd functions that use ._tensor can
+            # unintentionally maintain references to it (i.e. in torch_dispatch) or during dynamo JIT compilation.
+            warnings.warn(f"Dematerialize memory leak: ref count of _tensor {sys.getrefcount(self._tensor)}>2, some reference to _tensor still exists.\n{referrers.get_referrer_graph(self._tensor)}")
+        """
         del self._tensor
         return
     
     __torch_function__ = torch._C._disabled_torch_function_impl
     # list of view ops that we intercept in torch_dispatch, should be easy to add support for any listed https://pytorch.org/docs/stable/tensor_view.html
-    OVERRIDE_VIEW_OPS = [torch.ops.aten.view.default, torch.ops.aten.transpose.int]
+    # full list of aten ops https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/native_functions.yaml
+    OVERRIDE_VIEW_OPS = [torch.ops.aten.view.default, torch.ops.aten.transpose.int, torch.ops.aten._to_copy.default, torch.ops.aten.t.default]
+    
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
         # keep track of all materialized tensors
@@ -412,22 +431,23 @@ class RandumbTensor(torch.Tensor):
         # perform the operation with materialized tensors
         if func in cls.OVERRIDE_VIEW_OPS:
             instance: RandumbTensor = args[0]
-            # remember to deepcopy the list
-            view_ops = [i for i in instance.view_ops]
+            view_ops = instance.view_ops[:]
             view_ops.append((func, args, kwargs))
             with torch.no_grad():
                 # use faketensor to compute the final output shape, because we cannot change tensor.shape attribute once created, and if the output 
                 # shape doesn't match the grad that is returned in the bwd pass, then pytorch will throw an error.
-                with FakeTensorMode():
+                fake_mode = detect_fake_mode(args)
+                if fake_mode is None: fake_mode = FakeTensorMode()
+                with fake_mode:
                     fake = torch.empty(instance.shape)
                     fake = func(fake, *args[1:], **kwargs)
-                rt = RandumbTensor(instance._coef, instance.seed, fake.shape, instance.requires_grad, view_ops)
+                rt = RandumbTensor(instance._coef, instance.seed, fake.shape, view_ops)
                 rt._init_shape = instance._init_shape
+                del fake
             return rt
         else:
             ret = func(*tree_map(_materialize, args), **tree_map(_materialize, kwargs))
             
-        
         # dematerialize all previously materialized tensors
         for t in materialized_tensors:
             t.dematerialize()
@@ -451,6 +471,7 @@ class RandumbTensorConstructor(Function):
 
             ctx.dcoefs_size = coefs.numel()
             ctx.seed = seed
+            ctx.dtype = out.dtype
             return out
         else:
             raise AssertionError(f"Expected coefs to be of type torch.Tensor, found {type(coefs)} instead.")
@@ -458,9 +479,10 @@ class RandumbTensorConstructor(Function):
     @staticmethod
     def backward(ctx, grad):
         # flatten the grad back to same shape as materialize bwd output
-        grad = grad.view(-1)
+        # .flatten() instead of .view() as no guarantee the bwd tensor is contiguous
+        grad = grad.flatten()
         # run the actual bwd
-        dout = materialize_bwd(grad, ctx.dcoefs_size, ctx.seed)
+        dout = materialize_bwd(grad, ctx.dcoefs_size, ctx.seed).to(ctx.dtype)
         return dout, None, None
     
     @classmethod
