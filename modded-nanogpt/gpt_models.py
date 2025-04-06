@@ -290,6 +290,12 @@ class RT_GPT(nn.Module):
         self.num_decoder_layers = config.n_layer - self.num_encoder_layers # Remaining for decoder
         # Add learnable skip connection weights for decoder layers
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
+        # self.transformer = nn.ModuleDict(dict(
+        #     wte = nn.Embedding(config.vocab_size, config.n_embd),
+        #     # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
+        #     vte = nn.Embedding(config.vocab_size, config.n_embd*12),
+        #     h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+        # ))
         self.transformer = nn.ModuleDict(dict(
             wte = SillyEmbedding(config.vocab_size, config.n_embd, config.int_dim_gen, config.seed_gen),
             # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
@@ -318,7 +324,7 @@ class RT_GPT(nn.Module):
         vi = self.transformer.vte(idx[None]).chunk(12, dim=-1)
 
         # Store outputs for U-Net skip connections
-        skip_connections = []
+        skip_connections = [] 
         # Encoder pass - process only the first half of the blocks
         for i in range(self.num_encoder_layers):
             x = self.transformer.h[i](x, vi[i], x0, block_mask)

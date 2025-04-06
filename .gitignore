@@ -1,3 +1,9 @@
+
 __pycache__
+wandb
+logs
+*.pickle
+
 bench_out/
 dists/
+mnist/weight_dists/

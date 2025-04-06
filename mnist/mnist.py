@@ -1,4 +1,7 @@
 # adapted from https://github.com/pytorch/examples/blob/main/mnist/main.py
+import os
+
+
 import argparse
 import matplotlib.pyplot as plt
 
@@ -8,9 +11,12 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.optim.lr_scheduler import StepLR
+
+import wandb
 from src.SillyLayers import SillyLinear, SillyConv2d, stepgen
 
-from src.RandumbTensor import CreateRandumbTensor, getBack
+from src.RandumbTensor import CreateRandumbTensor
+from src.utils import getBack
 
 class Net(nn.Module):
     def __init__(self):
@@ -19,8 +25,8 @@ class Net(nn.Module):
         self.conv2 = nn.Conv2d(32, 64, 3, 1)
         self.dropout1 = nn.Dropout(0.25)
         self.dropout2 = nn.Dropout(0.5)
-        self.fc1 = nn.Linear(9216, 128)
-        self.fc2 = nn.Linear(128, 10)
+        self.fc1 = nn.Linear(9216, 128, bias=False)
+        self.fc2 = nn.Linear(128, 10, bias=False)
 
     def forward(self, x):
         x = self.conv1(x)
@@ -59,9 +65,7 @@ class SillyNet(nn.Module):
         self.fc1 = CastedLinear(9216, 128, int_dim_gen=int_dim_gen, seed_gen=seed_gen)
         
         # self.fc2 = nn.Linear(128, 10)
-        self.fc2 = SillyLinear(128, 10, int_dim=int_dim_gen, seed=seed_gen)
-        print(f"fc1 weight & bias: {self.fc1.weight} {self.fc1.weight.grad_fn} {self.fc1.bias}")
-        print(f"fc2 weight & bias: {self.fc2.weight} {self.fc2.weight.grad_fn} {self.fc2.bias}")
+        self.fc2 = CastedLinear(128, 10, int_dim_gen=int_dim_gen, seed_gen=seed_gen)
 
     def forward(self, x):
         x = self.conv1(x)
@@ -81,7 +85,7 @@ class SillyNet(nn.Module):
 
 def train(args, model, device, train_loader, optimizer, epoch, train_losses):
     model.train()
-    train_accumulation_steps = 4
+    # train_accumulation_steps = 4
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
@@ -89,23 +93,23 @@ def train(args, model, device, train_loader, optimizer, epoch, train_losses):
         loss = F.nll_loss(output, target)
         loss.backward()
         
-        if batch_idx % train_accumulation_steps == 0:
-            print(f"train accum steps reached for {batch_idx}")
-            for p in model.parameters():
-                print(f"p grad {p.grad.dtype} {p}")
-                p.grad /= train_accumulation_steps
+        # if batch_idx % train_accumulation_steps == 0:
+        #     for p in model.parameters():
+        #         p.grad /= train_accumulation_steps
                 
-            optimizer.step()
+        optimizer.step()
         if batch_idx % args.log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
                 100. * batch_idx / len(train_loader), loss.item()))
+            
             train_losses.append(loss.detach().item())
+            if args.wandb: wandb.log({"train_loss": loss.detach().item()})
             if args.dry_run:
                 break
 
 
-def test(model, device, test_loader, test_accs):
+def test(args, model, device, test_loader, test_accs):
     model.eval()
     test_loss = 0 
     correct = 0
@@ -122,6 +126,7 @@ def test(model, device, test_loader, test_accs):
     print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
+    if args.wandb: wandb.log({"test_loss": test_loss, "test_acc": 100. * correct / len(test_loader.dataset)})
 
 
 def main():
@@ -152,11 +157,22 @@ def main():
                         help='how many batches to wait before logging training status')
     parser.add_argument('--save-model', action='store_true', default=False,
                         help='For Saving the current Model')
+    parser.add_argument('--wandb', action='store_true', default=True,
+                    help='Include wandb logging')
     args = parser.parse_args()
     use_cuda = not args.no_cuda and torch.cuda.is_available()
     use_mps = not args.no_mps and torch.backends.mps.is_available()
 
     torch.manual_seed(args.seed)
+    
+    #TODO: normal model but with random tensors fully initialized, freeze only the noise matrices. see initial loss and training dynamics should be the same.
+    training_args = {"is_rand_model": True, "int_dim_offs": 128, "int_dim_step": 0, "seed_offs": 5, "seed_step": 4}
+    
+    if args.wandb:
+        run = wandb.init(
+            project="mnist",  # Specify your project
+            config=dict(vars(args), **training_args),  # convert args dataclass into dict and pass in all the configs
+        )
 
     if use_cuda:
         device = torch.device("cuda")
@@ -174,11 +190,18 @@ def main():
         train_kwargs.update(cuda_kwargs)
         test_kwargs.update(cuda_kwargs)
 
-    transform=transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,)),
-        transforms.ConvertImageDtype(torch.bfloat16)
-        ])
+
+    if training_args["is_rand_model"]:
+        transform=transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,)),
+            # transforms.ConvertImageDtype(torch.bfloat16)
+            ])
+    else:
+        transform=transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,)),
+            ])
     dataset1 = datasets.MNIST('../data', train=True, download=True,
                        transform=transform)
     dataset2 = datasets.MNIST('../data', train=False,
@@ -186,22 +209,41 @@ def main():
     train_loader = torch.utils.data.DataLoader(dataset1,**train_kwargs)
     test_loader = torch.utils.data.DataLoader(dataset2, **test_kwargs)
 
-    # generators for int_dim and seed
-    int_dim_gen = stepgen(128, 0)
-    seed_gen = stepgen(5, 4)
+    if training_args["is_rand_model"]:
+        # generators for int_dim and seed
+        int_dim_gen = stepgen(training_args["int_dim_offs"], training_args["int_dim_step"])
+        seed_gen = stepgen(training_args["seed_offs"], training_args["seed_step"])
 
-    model = SillyNet(int_dim_gen, seed_gen)
-    model = model.cuda().bfloat16()
-    for m in model.modules():
-        if isinstance(m, CastedLinear):
-            # m.to(torch.float32)
-            m.float()
-    # model = Net().to(device)
-    # model = torch.compile(model)
+        model = SillyNet(int_dim_gen, seed_gen)
+        model = model.cuda().float()
+        for m in model.modules():
+            if isinstance(m, CastedLinear):
+                # m.to(torch.float32)
+                m.float()
+    else:
+        model = Net().to(device)
+        model = torch.compile(model)
+        
+    if args.wandb: wandb.watch(model, log="all")
+    
+    # for module in model.modules():
+    #     print("converting to real")
+    #     if hasattr(module, 'weight') and hasattr(module.weight, 'get_materialized') and callable(module.weight.get_materialized):
+    #         module.weight = nn.Parameter(module.weight.get_materialized())
+    #         if module.bias is not None: module.bias = nn.Parameter(module.bias.get_materialized())
+            
     print("parameters optimized:")
     for name, param in model.named_parameters():
         if param.requires_grad:
             print(name, param.device, param.dtype)
+            # if param.dim() > 1:
+            #     print("2d xavier")
+            #     nn.init.xavier_normal_(param, gain=)
+            # else:
+            #     print("1d xavier")
+            #     nn.init.normal_(param)
+            lt.plot(param, center="mean").fig.savefig(f"{os.path.abspath(os.path.dirname(__file__))}/weight_dists/rand_model_leakyrelu/{name}.png")
+
     for buf in model.buffers():
         print(type(buf), buf.size(), buf.device)
 
@@ -210,11 +252,13 @@ def main():
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
     train_losses = []
     test_accs = []
+    test(args, model, device, test_loader, test_accs)
     for epoch in range(1, args.epochs + 1):
         train(args, model, device, train_loader, optimizer, epoch, train_losses)
-        test(model, device, test_loader, test_accs)
+        test(args, model, device, test_loader, test_accs)
         scheduler.step()
 
+    # NOTE: initial loss should be ln(10) = 2.30 
     fig, axs = plt.subplots(2)
     fig.suptitle(f'mnist train results, final acc {test_accs[-1]}%')
     axs[0].plot(train_losses)
@@ -225,6 +269,8 @@ def main():
 
     if args.save_model:
         torch.save(model.state_dict(), "mnist_cnn.pt")
+        
+    if args.wandb: run.finish()
 
 
 if __name__ == '__main__':

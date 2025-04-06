@@ -33,3 +33,17 @@ def _test_memory(
 def _tensor_mem(a: torch.Tensor):
     # return memory allocated for a tensor in MiB
     return a.element_size() * a.numel() / 2**20
+
+
+def getBack(var_grad_fn):
+    print(var_grad_fn)
+    for n in var_grad_fn.next_functions:
+        if n[0]:
+            try:
+                tensor = getattr(n[0], 'variable')
+                print(n[0])
+                print('Tensor with grad found:', tensor)
+                print(' - gradient:', tensor.grad)
+                print()
+            except AttributeError as e:
+                getBack(n[0])

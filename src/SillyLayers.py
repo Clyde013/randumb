@@ -15,7 +15,7 @@ from torch import Generator
 
 from torch.nn.common_types import _size_2_t
 
-from src.RandumbTensor import CreateRandumbTensor, RandumbTensor
+from src.RandumbTensor import CreateRandumbTensor, RandumbTensor, embed_fwd
 
 
 
@@ -34,7 +34,7 @@ def listgen(lst):
         yield i
 
 
-def init_kaiming_uniform(weight: RandumbTensor, bias: Optional[RandumbTensor], seed: int, a: float = math.sqrt(5), mode: str = "fan_in", nonlinearity: str = "relu", generator: Generator | None = None) -> None:
+def init_kaiming_uniform(weight: RandumbTensor, bias: Optional[RandumbTensor], seed: int, a: float = math.sqrt(5), mode: str = "fan_in", nonlinearity: str = "leaky_relu", generator: Generator | None = None) -> None:
     """
     This function is basically the entirity of any nn.Module layer's reset_parameters() function. Since this sequence of weight initialisation is shared by both linear and conv layers,
     the code is put into this function instead of duplicating the reset_parameters() for both the custom Linear and Conv layers.
@@ -46,7 +46,7 @@ def init_kaiming_uniform(weight: RandumbTensor, bias: Optional[RandumbTensor], s
         seed (int): self.seed of the layer
         a (float, optional): slope of the leaky_relu, shouldn't matter. Defaults to math.sqrt(5).
         mode (str, optional): should be always fan_in since we want to normalize values of the forward pass. Defaults to "fan_in".
-        nonlinearity (str, optional): Default pytorch is leaky_relu, but since we use relu layers. Defaults to "relu".
+        nonlinearity (str, optional): Default pytorch is leaky_relu. Ref: https://github.com/pytorch/pytorch/issues/15314 Defaults to "linear".
         generator (Generator | None, optional): Should be a generator created with seed, initialized below. Defaults to None.
     """
 
@@ -69,7 +69,7 @@ def init_kaiming_uniform(weight: RandumbTensor, bias: Optional[RandumbTensor], s
     bound = math.sqrt(3.0) * coef_std  # Calculate uniform bounds from standard deviation
     with torch.no_grad():
         weight._coef.uniform_(-bound, bound, generator=generator)
-        
+    
     # similar for bias
     if bias is not None:
         # as per nn.Linear implementation, we utilize fan_in and std computed from self.weight when initializing bias
@@ -246,14 +246,12 @@ class SillyConv2d(SillyModuleMixin, nn.Conv2d):
         self.weight_coef = nn.Parameter(torch.empty(self.int_dim[0], dtype=self.weight.dtype, device=self.weight.device), requires_grad=True)
         weight_shape = self.weight.shape
         del self.weight
-        # self.weight = CreateRandumbTensor(coefs=self.weight_coef, seed=self.seed[0], shape=weight_shape)
         self.register_buffer("weight", CreateRandumbTensor(coefs=self.weight_coef, seed=self.seed[0], shape=weight_shape))
         
         if self.bias is not None:
             self.bias_coef = nn.Parameter(torch.empty(self.int_dim[1], dtype=self.bias.dtype, device=self.bias.device), requires_grad=True)
             bias_shape = self.bias.shape
             del self.bias
-            # self.bias = CreateRandumbTensor(coefs=self.bias_coef, seed=self.seed[1], shape=bias_shape)
             self.register_buffer("bias", CreateRandumbTensor(coefs=self.bias_coef, seed=self.seed[1], shape=bias_shape))
         
         init_kaiming_uniform(self.weight, self.bias, self.seed[0])
@@ -317,10 +315,14 @@ class SillyEmbedding(SillyModuleMixin, nn.Embedding):
             assert list(_weight.shape) == [
                 num_embeddings,
                 embedding_dim,
-            ], "Shape of weight does not match num_embeddings and embedding_dim"
-            self.weight = _weight
+            ], f"Shape of weight {_weight.shape} does not match num_embeddings and embedding_dim"
+            self.register_buffer("weight", _weight)
+            self.weight_coef = self.weight._coef
 
         self.sparse = sparse
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return embed_fwd(input, self.weight_coef, self.embedding_dim, self.weight.seed)
 
     def reset_parameters(self) -> None:
         init_kaiming_uniform(self.weight, None, seed=self.seed[0])

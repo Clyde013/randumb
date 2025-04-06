@@ -228,6 +228,7 @@ class Hyperparameters:
     # seed generator params
     offset: int = 13
     stepsize: int = 7
+    int_dim: int = 256
 args = Hyperparameters()
 
 # -----------------------------------------------------------------------------
@@ -237,6 +238,7 @@ if args.normal_model:
 else:
     from gpt_models import RT_GPT as GPT, RT_GPTConfig as GPTConfig, RT_CastedLinear as CastedLinear
 
+# NOTE: the expected starting loss should be ln(num_vocab) = 10.8258
 
 if args.wandb_integration:
     run = wandb.init(
@@ -318,7 +320,7 @@ if args.normal_model:
     conf = GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768)
 else:
     # sort of hardcoded the int_dim, constant 128 across all layers
-    int_dim_gen = stepgen(4, 0)
+    int_dim_gen = stepgen(args.int_dim, 0)
     seed_gen = stepgen(args.offset, args.stepsize)
     conf = GPTConfig(int_dim_gen=int_dim_gen, seed_gen=seed_gen, vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768)
     

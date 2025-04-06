@@ -24,6 +24,8 @@ import sys
 import referrers
 import warnings
 import os
+
+from src.utils import getBack
 os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 
 import torch
@@ -77,7 +79,7 @@ def squirrel5_generate(N, M, seed=1337):
     return output
 
 
-
+# trition kernel implementations for the tensor
 @triton.jit
 def squirrel5_gen(cols: tl.tensor, rows: tl.tensor, seed):
     """    
@@ -151,18 +153,20 @@ def squirrel5_gen_T(cols: tl.tensor, rows: tl.tensor, seed):
     return mangledBits
 
 # kernel configs for both materialize fwd and bwd
-kernel_cfgs = [
+mat_kernel_cfgs = [
     triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 4}, num_warps=4),
     triton.Config(kwargs={'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_M': 4}, num_warps=4),
     triton.Config(kwargs={'BLOCK_SIZE_N': 1024, 'BLOCK_SIZE_M': 4}, num_warps=4),
-    # triton.Config(kwargs={'BLOCK_SIZE_N': 16, 'BLOCK_SIZE_M': 16}, num_warps=4),
-    # triton.Config(kwargs={'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_M': 16}, num_warps=4),
-    # triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 16}, num_warps=4),
-    # triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 128}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 32}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_M': 32}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_SIZE_N': 1024, 'BLOCK_SIZE_M': 32}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 64}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_M': 64}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_SIZE_N': 1024, 'BLOCK_SIZE_M': 64}, num_warps=4),
 ]
 
 
-@triton.autotune(configs=kernel_cfgs, key=['N', 'M'])
+@triton.autotune(configs=mat_kernel_cfgs, key=['N', 'M'])
 @triton.jit
 def materialize_fwd_kernel(out_ptr,    # ptr to output vector
                 coef_ptr,  # ptr to the coefficients vector
@@ -172,7 +176,7 @@ def materialize_fwd_kernel(out_ptr,    # ptr to output vector
     """
     Fused kernel utilizing squirrel5 noise function to materialize a (N,) sized output vector (that is later arbitrarily reshaped)
     The out_ptr is the output vector of shape (N,)
-    The coeff_ptr is the coefficient vector of shape (M,)
+    The coef_ptr is the coefficient vector of shape (M,)
     The noise function should lazily materialize the (N, M) matrix row by row (along N dim), each row getting fused dot product'd with
     the entire coef matrix, which should result in cache hits every time because the coef matrix should be perma loaded into SRAM.
     The resulting equation is:    noise @ coef = out
@@ -184,7 +188,7 @@ def materialize_fwd_kernel(out_ptr,    # ptr to output vector
     
     # iterate along M-dim. These aren't "true" blocks in the sense that computation for blocks is split between pids, all chunks of computation here
     # are done in the same pid/block, this is more like "phases" within a single block, beacuse we require value of the entire vector to compute the dot product.
-    accumulator = tl.zeros((BLOCK_SIZE_N, 1), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
     for m in range(0, tl.cdiv(M, BLOCK_SIZE_M)):
         offs_m = m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         
@@ -200,12 +204,12 @@ def materialize_fwd_kernel(out_ptr,    # ptr to output vector
         
         # dot product via broadcast of elementwise multiplication of coeffs across N-dim of materialized noise matrix
         # followed by summation along M-dim
-        accumulator += tl.sum(mangledBits * coefs, axis=1)[:, None]  # [1, BLOCK_SIZE_N]
+        accumulator += tl.sum(mangledBits * coefs, axis=1)  # [BLOCK_SIZE_N,]
         
-    tl.store(out_ptr + offs_n[:, None], accumulator, mask=mask[:, None])
+    tl.store(out_ptr + offs_n, accumulator, mask=mask)
 
 
-@triton.autotune(configs=kernel_cfgs, key=['N', 'M'])
+@triton.autotune(configs=mat_kernel_cfgs, key=['N', 'M'])
 @triton.jit
 def materialize_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
                 dout_ptr,  # ptr to the dout vector
@@ -217,8 +221,11 @@ def materialize_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
     Since the noise matrix is transposed, the dims of it are (m, n) instead.
     given the eqn: noise @ coef = out |   (n, m) @ (m, 1) = (n, 1)
     dcoef = noise.T @ dout    |   (m, 1) = (m, n) @ (n, 1)
-    we generate the transpose of the noise matrix and fuse the matmul, making the backward pass for this function 
-    almost the exact same time complexity as the forward pass.
+    we generate the transpose of the noise matrix and fuse the matmul. Unfortunately because usually m << n this algorithm becomes very
+    inefficient. 
+    TODO: some form of split-k for the m << n issue. this is beyond my bandwidth atm though. 
+    ref: https://github.com/triton-lang/triton/blob/2acaa4d0dd61b4936a62327a144af536715bf96a/python/triton/ops/matmul.py
+    if training is fast enough i will ignore this until it becomes an issue.
     """
     # identifies correct memory address of the part of the dcoef vector we are writing to
     pid = tl.program_id(0)
@@ -226,7 +233,7 @@ def materialize_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
     mask = offs_m < M
     
     # iterate along N-dim (of the "transposed" noise matrix)
-    accumulator = tl.zeros((BLOCK_SIZE_M, 1), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
     for n in range(0, tl.cdiv(N, BLOCK_SIZE_N)):
         offs_n = n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         
@@ -242,9 +249,9 @@ def materialize_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
         
         # dot product via broadcast of elementwise multiplication of dout across M-dim of materialized noise matrix
         # followed by summation along N-dim
-        accumulator += tl.sum(mangledBits * dout, axis=1)[:, None] # [1, BLOCK_SIZE_M]
+        accumulator += tl.sum(mangledBits * dout, axis=1) # [BLOCK_SIZE_M,]
         
-    tl.store(dcoef_ptr + offs_m[:, None], accumulator, mask=mask[:, None])
+    tl.store(dcoef_ptr + offs_m, accumulator, mask=mask)
 
 
 @triton_op("randumblib::materialize_fwd", mutates_args={})
@@ -262,24 +269,24 @@ def materialize_bwd(dout: torch.Tensor, dcoefs_size: int, seed: int) -> torch.Te
     wrap_triton(materialize_bwd_kernel)[grid](dcoefs, dout, dout.numel(), dcoefs_size, seed)
     return dcoefs
 
-def backward(ctx, grad):
+def _mat_backward(ctx, grad):
     dcoefs = materialize_bwd(grad, ctx.dcoefs_size, ctx.seed)
-    # only coefs needs grad, the rest are non-differentiable. function signature of fwd: coefs, size, seed, device
+    # only coefs needs grad, the rest are non-differentiable. function signature of fwd: coefs, size, seed
     return dcoefs, None, None, None
 
-def setup_context(ctx, inputs, output):
+def _mat_setup_context(ctx, inputs, output):
     coefs, size, seed = inputs
     ctx.dcoefs_size = coefs.numel()
     ctx.seed = seed
 
-materialize_fwd.register_autograd(backward, setup_context=setup_context)
+materialize_fwd.register_autograd(_mat_backward, setup_context=_mat_setup_context)
 
 @materialize_fwd.register_kernel("cpu")
-def _fwd(coefs: torch.Tensor, size: int, seed: int):
+def _mat_fwd(coefs: torch.Tensor, size: int, seed: int):
     raise NotImplementedError("Unsupported CPU implementation of materialize_fwd called.")
 
 @materialize_bwd.register_kernel("cpu")
-def _bwd(dout: torch.Tensor, dcoefs_size: int, seed: int):
+def _mat_bwd(dout: torch.Tensor, dcoefs_size: int, seed: int):
     raise NotImplementedError("Unsupported CPU implementation of materialize_fwd called.")
 
 
@@ -493,22 +500,171 @@ class RandumbTensorConstructor(Function):
 # alias for the constructor, use this as `rt = CreateRandumbTensor(...)`
 CreateRandumbTensor = RandumbTensorConstructor.apply
 
-def getBack(var_grad_fn):
-    print(var_grad_fn)
-    for n in var_grad_fn.next_functions:
-        if n[0]:
-            try:
-                tensor = getattr(n[0], 'variable')
-                print(n[0])
-                print('Tensor with grad found:', tensor)
-                print(' - gradient:', tensor.grad)
-                print()
-            except AttributeError as e:
-                getBack(n[0])
+
+# triton kernel implementation for the embedding layer
+@triton.autotune(configs=[
+    triton.Config(kwargs={'BLOCK_SIZE_ROW': 128, 'BLOCK_SIZE_M': 4, 'BLOCK_SIZE_IDX': 16}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_SIZE_ROW': 256, 'BLOCK_SIZE_M': 4, 'BLOCK_SIZE_IDX': 16}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_SIZE_ROW': 1024, 'BLOCK_SIZE_M': 4, 'BLOCK_SIZE_IDX': 16}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_SIZE_ROW': 256, 'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_IDX': 16}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_SIZE_ROW': 1024, 'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_IDX': 16}, num_warps=4),
+    
+    ], key=['rowsize', 'M', 'idx_size'])
+@triton.jit
+def embed_fwd_kernel(out_ptr,   # ptr to output vector
+                coef_ptr,   # ptr to the coefficients vector
+                idx_ptr,    # ptr to the row indices vector
+                rowsize,    # row size. should be stride[0] of the 2d embedding matrix
+                M, idx_size, # sizes of the vectors
+                seed,   # seed for the generated tensor
+                stride_out_row, # stride[0] of the output vector
+                BLOCK_SIZE_ROW: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_IDX: tl.constexpr):
+    """
+    Fused kernel utilizing squirrel5 noise function to materialize specific idx_ptr rows of a RandumbTensor acting as a 2d embedding matrix
+    The out_ptr is the output vector of shape (idx_size, rowsize)
+    The coef_ptr is the coefficient vector of shape (M,)
+    This function should launch using a 2d grid of BLOCK_SIZE_IDX, BLOCK_SIZE_N. Each pid is responsible for a BLOCK_SIZE_IDX num of indices and
+    BLOCK_SIZE_ROW chunk of the output matrix indexed by idx_ptr[pid]. The pid lazily materializes a BLOCK_SIZE_ROW sequential chunk of the 
+    (rowsize, M) subset of the noise matrix (indexed by idx_ptr) and matmuls it with the coef matrix in BLOCK_SIZE_M chunks.
+    It might be a bit inefficient compared to the alternative of launching one pid per index, but if you can oneshot the rowsize-dim computation or
+    allocating rowsize'd chunk doesn't completely oom the GPU, then we might as well allocate the blocks for other indices as well.
+    """
+    pid_idx = tl.program_id(0)
+    pid_row = tl.program_id(1)
+    
+    # locates correct block of indices to load
+    offs_idx = pid_idx * BLOCK_SIZE_IDX + tl.arange(0, BLOCK_SIZE_IDX)
+    mask_idx = offs_idx < idx_size
+    idxs = tl.load(idx_ptr + offs_idx, mask_idx)
+    
+    # usually non-contiguous memory reads would be extremely expensive, but since the noise matrix doesn't actually exist in memory, we can materialize
+    # arbitrary non-contiguous row indices. So we compute [BLOCK_SIZE_IDX, BLOCK_SIZE_ROW], each entry in BLOCK_SIZE_IDX is the ptr locating the start of
+    # the row, then BLOCK_SIZE_ROW locates the specific chunk of the row that we are computing on. Then we flatten everything since squirrel5_gen accepts 1D input.
+    offs_row = pid_row * BLOCK_SIZE_ROW + tl.arange(0, BLOCK_SIZE_ROW)
+    offs_n = tl.ravel( (idxs * rowsize)[:, None] + offs_row[None, :] )
+     
+    # iterate along M-dim. These aren't "true" blocks in the sense that computation for blocks is split between pids, all chunks of computation here
+    # are done in the same pid/block, this is more like "phases" within a single block, beacuse we require value of the entire vector to compute the dot product.
+    accumulator = tl.zeros((BLOCK_SIZE_IDX, BLOCK_SIZE_ROW), dtype=tl.float32)
+    for m in range(0, tl.cdiv(M, BLOCK_SIZE_M)):
+        offs_m = m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        
+        # squirrel5 noise function
+        mangledBits = squirrel5_gen(offs_m, offs_n, seed)   # [BLOCK_SIZE_IDX * BLOCK_SIZE_ROW, BLOCK_SIZE_M]
+        
+        # mask off mangledBits that are > M, otherwise this will affect the final dot product
+        # we do this by masking off the respective coef that would elementwise multiply with the
+        # out of bounds mangledBits, thereby masking those out as well
+        mask_M = offs_m < M
+        # load the subgroup of coefficients we are processing
+        coefs = tl.load(coef_ptr + offs_m, mask=mask_M)[None, :]  # [1, BLOCK_SIZE_M]
+        
+        # dot product via broadcast of elementwise multiplication of coeffs across N-dim of materialized noise matrix
+        # followed by summation along M-dim
+        accumulator += tl.sum(mangledBits * coefs, axis=1).reshape(BLOCK_SIZE_IDX, BLOCK_SIZE_ROW, can_reorder=False)  # [BLOCK_SIZE_IDX, BLOCK_SIZE_ROW]
+        
+    # locates the ptr for the correct idx entries
+    offs_idx = (offs_idx * stride_out_row)[:, None]
+    # locates ptrs for correct BLOCK of row that this pid computed
+    offs_row = offs_row[None, :]
+    out_ptrs = out_ptr + offs_idx + offs_row
+    mask = (offs_idx < idx_size * rowsize) & (offs_row < rowsize)
+    tl.store(out_ptrs, accumulator, mask=mask)
+
+@triton.autotune(configs=[
+    triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 16}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_M': 16}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_SIZE_N': 1024, 'BLOCK_SIZE_M': 16}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 32}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_M': 32}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_SIZE_N': 1024, 'BLOCK_SIZE_M': 32}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 64}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_M': 64}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_SIZE_N': 1024, 'BLOCK_SIZE_M': 64}, num_warps=4),
+    ], key=['rowsize', 'M'])
+@triton.jit
+def embed_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
+                dout_ptr,  # ptr to the dout vector
+                idx_ptr,    # ptr to the row indices vector
+                rowsize,    # row size. should be stride[0] of the 2d embedding matrix
+                M, idx_size, # sizes of the vectors
+                seed,   # seed for the generated tensor
+                BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_M: tl.constexpr):
+    """
+    Backward pass of the embedding kernel. Unfortunately since both BLOCK_SIZE_IDX and BLOCK_SIZE_ROW operate on the n-dim, and any row of n-dim must
+    be processed by one pid/block because of the accumulation dot product, there is no point in splitting that dimension further into smaller blocks.
+    TODO: also split-k optimization
+    """
+    # identifies correct memory address of the part of the dcoef vector we are writing to
+    pid = tl.program_id(0)
+    offs_m = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    mask = offs_m < M
+    
+    # iterate along N-dim (of the "transposed" noise matrix)
+    accumulator = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
+    # N = idx_size * rowsize
+    for i in range(0, idx_size):
+        idx = tl.load(idx_ptr + i)
+        for n in range(0, tl.cdiv(rowsize, BLOCK_SIZE_N)):
+            offs_n = n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+            
+            # squirrel5 noise function
+            mangledBits = squirrel5_gen_T(offs_m, idx * rowsize + offs_n, seed)   # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+            
+            # mask off mangledBits that are > N, otherwise this will affect the final dot product
+            # we do this by masking off the respective coef that would elementwise multiply with the
+            # out of bounds mangledBits, thereby masking those out as well
+            mask_N = offs_n < rowsize
+            # load the subgroup of dout we are processing
+            dout = tl.load(dout_ptr + i * rowsize + offs_n, mask=mask_N)[None, :]  # [1, BLOCK_SIZE_N]
+            
+            # dot product via broadcast of elementwise multiplication of dout across M-dim of materialized noise matrix
+            # followed by summation along N-dim
+            accumulator += tl.sum(mangledBits * dout, axis=1) # [BLOCK_SIZE_M,]
+            
+    tl.store(dcoef_ptr + offs_m, accumulator, mask=mask)
+
+
+@triton_op("randumblib::embed_fwd", mutates_args={})
+def embed_fwd(idx: torch.Tensor, coefs: torch.Tensor, rowsize: int, seed: int) -> torch.Tensor:
+    output = torch.empty(size=(*idx.shape, rowsize), device=coefs.device)
+    grid = lambda meta: ( triton.cdiv(idx.numel(), meta['BLOCK_SIZE_IDX']), triton.cdiv(rowsize, meta['BLOCK_SIZE_ROW']), )
+    wrap_triton(embed_fwd_kernel)[grid](output, coefs, idx, rowsize, coefs.numel(), idx.numel(), seed, output.stride(-2))
+    return output
+
+@triton_op("randumblib::embed_bwd", mutates_args={})
+def embed_bwd(idx: torch.Tensor, dout: torch.Tensor, dcoefs_size: int, rowsize: int, seed: int) -> torch.Tensor:
+    # note to self: should we enforce dout to be a flattened tensor? it doesn't seem to be necessary
+    dcoefs = torch.empty(size=(dcoefs_size,), device=dout.device)
+    grid = lambda meta: (triton.cdiv(dcoefs_size, meta['BLOCK_SIZE_M']), ) 
+    wrap_triton(embed_bwd_kernel)[grid](dcoefs, dout, idx, rowsize, dcoefs_size, idx.numel(), seed)
+    return dcoefs
+
+def _embed_backward(ctx, grad):
+    idx = ctx.saved_tensors[0]
+    dcoefs = embed_bwd(idx, grad, ctx.dcoefs_size, ctx.rowsize, ctx.seed)
+    # only coefs needs grad, the rest are non-differentiable. function signature of fwd: idx, coefs, rowsize, seed
+    return None, dcoefs, None, None
+
+def _embed_setup_context(ctx, inputs, output):
+    idx, coefs, rowsize, seed = inputs
+    ctx.save_for_backward(idx)
+    ctx.dcoefs_size = coefs.numel()
+    ctx.rowsize = rowsize
+    ctx.seed = seed
+
+embed_fwd.register_autograd(_embed_backward, setup_context=_embed_setup_context)
+
+@embed_fwd.register_kernel("cpu")
+def _embed_fwd(idx: torch.Tensor, coefs: torch.Tensor, rowsize: int, seed: int):
+    raise NotImplementedError("Unsupported CPU implementation of embed_fwd called.")
+
+@embed_bwd.register_kernel("cpu")
+def _embed_bwd(dout: torch.Tensor, dcoefs_size: int, seed: int):
+    raise NotImplementedError("Unsupported CPU implementation of embed_bwd called.")
+
 
 if __name__ == "__main__":    
-
-                
     torch.manual_seed(0)
     DEVICE = "cuda" 
     seed = 1337
