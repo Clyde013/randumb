@@ -17,7 +17,7 @@ from torch.profiler import profile, record_function, ProfilerActivity
 import triton
 import triton.language as tl
 
-from src.RandumbTensor import CreateRandumbTensor, squirrel5_generate, materialize_fwd
+from src.RandumbTensor import CreateRandumbTensor, squirrel5_generate, materialize_fwd, materialize_bwd
 from src.SillyLayers import SillyLinear
 
 from utils import _test_memory
@@ -293,6 +293,48 @@ def benchmark_mem_bwd(size, provider):
         
     return mem_20, mem_50, mem_80
 
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=['size'],  # Argument names to use as an x-axis for the plot.
+        x_vals=[2**i for i in range(2, 20, 1)],  # Different possible values for `size`.
+        x_log=True,  # x axis is logarithmic.
+        line_arg='provider',  # Argument name whose value corresponds to a different line in the plot.
+        line_vals=['torch', 'splitn'],  # Possible values for `line_arg`.
+        line_names=['torch', 'splitn'],  # Label name for the lines.
+        styles=[('green', '-'), ('red', '-')],  # Line styles.
+        ylabel='ms',  # Label name for the y-axis.
+        plot_name='speed performance',  # Name for the plot. Used also as a file name for saving the plot.
+        args={},  # Values for function arguments not in `x_names` and `y_name`.
+    ))
+def benchmark_speed_bwd(size, provider):
+    """
+    Benchmarks the speed of tensor operations with a RandumbTensor vs normal tensors.
+    `m` being the intermediate dimension of the rt.
+    """
+    quantiles = [0.5, 0.2, 0.8]
+    
+    dcoefs_size, seed = 256, 1337
+    dout = torch.ones((size,), dtype=torch.float32, device="cuda")
+    
+    noise_mat = squirrel5_generate(size, dcoefs_size, seed)
+    
+    def torch_impl():
+        noise_mat.T @ dout
+        return
+    
+    def matmul_splitn_impl():
+        # for fair comparison, since the RT applies view ops every time it's called, we call view op here instead of caching it
+        materialize_bwd(dout, dcoefs_size, seed)
+        return
+    
+    if provider == 'torch':
+        ms, min_ms, max_ms = triton.testing.do_bench(torch_impl, quantiles=quantiles)
+
+    if provider == 'splitn':
+        ms, min_ms, max_ms = triton.testing.do_bench(matmul_splitn_impl, quantiles=quantiles)
+        
+    return ms, max_ms, min_ms
+
 
 def profile_mem():
     num_elems = 1024
@@ -493,8 +535,9 @@ if __name__ == "__main__":
     
     # benchmarks the speed and memory consumption
     # benchmark_mem_materialize.run(print_data=True, show_plots=True, save_path='bench_out')
-    # benchmark_speed_materialize.run(print_data=True, show_plots=True, save_path='bench_out')
+    benchmark_speed_materialize.run(print_data=True, show_plots=True, save_path='bench_out')
     benchmark_speed_rt.run(print_data=True, show_plots=True, save_path='bench_out')
+    benchmark_speed_bwd.run(print_data=True, show_plots=True, save_path='bench_out')
 
     # check_train_loop()
     plot_dist()

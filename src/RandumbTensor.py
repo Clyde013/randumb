@@ -209,34 +209,53 @@ def materialize_fwd_kernel(out_ptr,    # ptr to output vector
     tl.store(out_ptr + offs_n, accumulator, mask=mask)
 
 
-@triton.autotune(configs=mat_kernel_cfgs, key=['N', 'M'])
+# torch.empty() initialization needs to be zerod out since we use tl.atomic_add instead of tl.store
+def _zero_output(*args, **kwargs):
+	args[0]["dcoef_ptr"].zero_()
+ 
+bwd_mat_kernel_cfgs = [
+    triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 4, 'SPLIT_N': 4}, num_warps=4, pre_hook=_zero_output),
+    triton.Config(kwargs={'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_M': 4, 'SPLIT_N': 4}, num_warps=4, pre_hook=_zero_output),
+    triton.Config(kwargs={'BLOCK_SIZE_N': 1024, 'BLOCK_SIZE_M': 4, 'SPLIT_N': 4}, num_warps=4, pre_hook=_zero_output),
+    triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 4, 'SPLIT_N': 16}, num_warps=4, pre_hook=_zero_output),
+    triton.Config(kwargs={'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_M': 4, 'SPLIT_N': 16}, num_warps=4, pre_hook=_zero_output),
+    triton.Config(kwargs={'BLOCK_SIZE_N': 1024, 'BLOCK_SIZE_M': 4, 'SPLIT_N': 16}, num_warps=4, pre_hook=_zero_output),
+]
+@triton.autotune(configs=bwd_mat_kernel_cfgs, key=['N', 'M'])
 @triton.jit
 def materialize_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
                 dout_ptr,  # ptr to the dout vector
                 N, M,   # sizes of the vectors
                 seed,   # seed for the generated tensor
-                BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_M: tl.constexpr):
-    """
+                BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, SPLIT_N: tl.constexpr):
+    """    
     Backwards pass of the above materialization kernel. This one will compute dcoef via dout and generating the transposed noise matrix.
     Since the noise matrix is transposed, the dims of it are (m, n) instead.
     given the eqn: noise @ coef = out |   (n, m) @ (m, 1) = (n, 1)
     dcoef = noise.T @ dout    |   (m, 1) = (m, n) @ (n, 1)
-    we generate the transpose of the noise matrix and fuse the matmul. Unfortunately because usually m << n this algorithm becomes very
-    inefficient. 
-    TODO: some form of split-k for the m << n issue. this is beyond my bandwidth atm though. 
-    ref: https://github.com/triton-lang/triton/blob/2acaa4d0dd61b4936a62327a144af536715bf96a/python/triton/ops/matmul.py
-    if training is fast enough i will ignore this until it becomes an issue.
+    We generate the transpose of the noise matrix and fuse the matmul. Unfortunately because usually m << n the naive algorithm becomes very
+    inefficient. Implements split-k along N dim, in order to get coalesced loads we want to interleave the blocks such that each pid 
+    simultaneously loads consecutive blocks during each for loop iteration. The N dimension is split into (BLOCK_SIZE_N * SPLIT_N) sized 
+    coalesced loads, for a total number of N // (BLOCK_SIZE_N * SPLIT_N) loads. Each pid should process a separate BLOCK_SIZE_N block of 
+    a particular load.
     """
     # identifies correct memory address of the part of the dcoef vector we are writing to
-    pid = tl.program_id(0)
-    offs_m = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    mask = offs_m < M
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    mask_m = offs_m < M
     
+    # start at first block to load
+    pid_n = tl.program_id(1)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)    
+    # these are just compiler hints, note multiple_of documentation is wrong, ref: https://github.com/triton-lang/triton/issues/1324
+    offs_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_SIZE_N), BLOCK_SIZE_N)
+    
+    # size of each coalesced load
+    LOAD_SIZE = BLOCK_SIZE_N*SPLIT_N
     # iterate along N-dim (of the "transposed" noise matrix)
     accumulator = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
-    for n in range(0, tl.cdiv(N, BLOCK_SIZE_N)):
-        offs_n = n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        
+    # n-th coalesced load of size BLOCK_SIZE_N * SPLIT_N
+    for n in range(0, tl.cdiv(N, LOAD_SIZE)):
         # squirrel5 noise function
         mangledBits = squirrel5_gen_T(offs_m, offs_n, seed)   # [BLOCK_SIZE_M, BLOCK_SIZE_N]
         
@@ -251,8 +270,11 @@ def materialize_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
         # followed by summation along N-dim
         accumulator += tl.sum(mangledBits * dout, axis=1) # [BLOCK_SIZE_M,]
         
-    tl.store(dcoef_ptr + offs_m, accumulator, mask=mask)
-
+        # jump to next block to load
+        offs_n += LOAD_SIZE
+    
+    accumulator = accumulator.to(dcoef_ptr.dtype.element_ty)
+    tl.atomic_add(dcoef_ptr + offs_m, accumulator, mask=mask_m, sem="relaxed")
 
 @triton_op("randumblib::materialize_fwd", mutates_args={})
 def materialize_fwd(coefs: torch.Tensor, size: int, seed: int) -> torch.Tensor:
@@ -264,8 +286,9 @@ def materialize_fwd(coefs: torch.Tensor, size: int, seed: int) -> torch.Tensor:
 @triton_op("randumblib::materialize_bwd", mutates_args={})
 def materialize_bwd(dout: torch.Tensor, dcoefs_size: int, seed: int) -> torch.Tensor:
     # note to self: should we enforce dout to be a flattened tensor? it doesn't seem to be necessary
+    assert dout.is_contiguous(), "dout is not contiguous, backwards pass might give incorrect results."
     dcoefs = torch.empty(size=(dcoefs_size,), device=dout.device)
-    grid = lambda meta: (triton.cdiv(dcoefs_size, meta['BLOCK_SIZE_M']), )
+    grid = lambda meta: (triton.cdiv(dcoefs_size, meta['BLOCK_SIZE_M']), meta['SPLIT_N'])
     wrap_triton(materialize_bwd_kernel)[grid](dcoefs, dout, dout.numel(), dcoefs_size, seed)
     return dcoefs
 
