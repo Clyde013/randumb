@@ -20,10 +20,9 @@ Squirrel5 noise based prng generation implementation is adapted from http://eise
 
 from typing import Union
 from collections.abc import Iterable
-import sys
-import referrers
-import warnings
 import os
+import itertools
+import math
 
 from src.utils import getBack
 os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
@@ -43,11 +42,37 @@ from torch.profiler import profile, record_function
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch._guards import detect_fake_mode
 
+
+def construct_configs(cfgs: dict, min_blocks: int, max_blocks: int, *args, **kwargs):
+	"""
+	Helper function for constructing triton autotune configs.
+	Example usage: 
+ 	configs = construct_configs({"BLOCK_SIZE_N": [2**i for i in range(4, 7)], 
+								"BLOCK_SIZE_M": [2**i for i in range(4, 7)], 
+								"SPLIT_N": [2**i for i in range(4, 7)]}, None, 32 * 32 * 16 + 1, num_warps=4)
+	Args:
+		cfgs (dict): key should be block_size, and the value a list of possible values
+		min_blocks (int): only include configs where total product of block_sizes is more than or equal this
+		max_blocks (int): only include configs where total product of block_sizes is less than or equal this
+
+	Returns:
+		list of possible triton.Config objects
+	"""
+	if min_blocks is None: min_blocks = -math.inf
+	if max_blocks is None: max_blocks = math.inf
+	permutations = itertools.product(*cfgs.values())
+	configs = []
+	for values in permutations:
+		prod = math.prod(values)
+		if prod >= min_blocks and prod <= max_blocks:
+			configs.append(triton.Config(kwargs=dict(zip(cfgs.keys(), values)), *args, **kwargs))
+	return configs
+
+
 # the following is a standalone helper kernel implementation, used mainly for crosschecking correctness of the more complex implementations
-@triton.autotune(configs=[
-    triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 128}, num_warps=4),
-    ],
-    key=['N', 'M']
+@triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [2**i for i in range(2, 8)], 
+                                            "BLOCK_SIZE_M": [2**i for i in range(2, 8)]}, 4 * 64, None, num_warps=4),
+                 key=['N', 'M']
 )
 @triton.jit
 def squirrel5_kernel(out_ptr,    # ptr to output vector (N, M)
@@ -152,21 +177,9 @@ def squirrel5_gen_T(cols: tl.tensor, rows: tl.tensor, seed):
     mangledBits = ( ONE_OVER_MAX_INT * mangledBits.to(tl.int32).to(tl.float32) ).to(tl.float32)
     return mangledBits
 
-# kernel configs for both materialize fwd and bwd
-mat_kernel_cfgs = [
-    triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 4}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_M': 4}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 1024, 'BLOCK_SIZE_M': 4}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 32}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_M': 32}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 1024, 'BLOCK_SIZE_M': 32}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 64}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_M': 64}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 1024, 'BLOCK_SIZE_M': 64}, num_warps=4),
-]
-
-
-@triton.autotune(configs=mat_kernel_cfgs, key=['N', 'M'])
+@triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [2**i for i in range(8, 11)],
+                                            "BLOCK_SIZE_M": [2**i for i in range(2, 8)]}, None, None, num_warps=4),
+                 key=['N', 'M'])
 @triton.jit
 def materialize_fwd_kernel(out_ptr,    # ptr to output vector
                 coef_ptr,  # ptr to the coefficients vector
@@ -213,15 +226,11 @@ def materialize_fwd_kernel(out_ptr,    # ptr to output vector
 def _zero_output(*args, **kwargs):
 	args[0]["dcoef_ptr"].zero_()
  
-bwd_mat_kernel_cfgs = [
-    triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 4, 'SPLIT_N': 4}, num_warps=4, pre_hook=_zero_output),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_M': 4, 'SPLIT_N': 4}, num_warps=4, pre_hook=_zero_output),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 1024, 'BLOCK_SIZE_M': 4, 'SPLIT_N': 4}, num_warps=4, pre_hook=_zero_output),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 4, 'SPLIT_N': 16}, num_warps=4, pre_hook=_zero_output),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_M': 4, 'SPLIT_N': 16}, num_warps=4, pre_hook=_zero_output),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 1024, 'BLOCK_SIZE_M': 4, 'SPLIT_N': 16}, num_warps=4, pre_hook=_zero_output),
-]
-@triton.autotune(configs=bwd_mat_kernel_cfgs, key=['N', 'M'])
+
+@triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [2**i for i in range(8, 11)],
+                                            "BLOCK_SIZE_M": [4, 16], 
+                                            "SPLIT_N": [4, 8, 16]}, None, None, num_warps=4, pre_hook=_zero_output),
+                 key=['N', 'M'])
 @triton.jit
 def materialize_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
                 dout_ptr,  # ptr to the dout vector
@@ -525,14 +534,10 @@ CreateRandumbTensor = RandumbTensorConstructor.apply
 
 
 # triton kernel implementation for the embedding layer
-@triton.autotune(configs=[
-    triton.Config(kwargs={'BLOCK_SIZE_ROW': 128, 'BLOCK_SIZE_M': 4, 'BLOCK_SIZE_IDX': 16}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_ROW': 256, 'BLOCK_SIZE_M': 4, 'BLOCK_SIZE_IDX': 16}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_ROW': 1024, 'BLOCK_SIZE_M': 4, 'BLOCK_SIZE_IDX': 16}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_ROW': 256, 'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_IDX': 16}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_ROW': 1024, 'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_IDX': 16}, num_warps=4),
-    
-    ], key=['rowsize', 'M', 'idx_size'])
+@triton.autotune(configs=construct_configs({"BLOCK_SIZE_ROW": [128, 256, 1024],
+                                            "BLOCK_SIZE_M": [4, 16], 
+                                            "BLOCK_SIZE_IDX": [4, 16]}, None, None, num_warps=4), 
+                 key=['rowsize', 'M', 'idx_size'])
 @triton.jit
 def embed_fwd_kernel(out_ptr,   # ptr to output vector
                 coef_ptr,   # ptr to the coefficients vector
@@ -594,17 +599,10 @@ def embed_fwd_kernel(out_ptr,   # ptr to output vector
     mask = (offs_idx < idx_size * rowsize) & (offs_row < rowsize)
     tl.store(out_ptrs, accumulator, mask=mask)
 
-@triton.autotune(configs=[
-    triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 16}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_M': 16}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 1024, 'BLOCK_SIZE_M': 16}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 32}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_M': 32}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 1024, 'BLOCK_SIZE_M': 32}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 64}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_M': 64}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_SIZE_N': 1024, 'BLOCK_SIZE_M': 64}, num_warps=4),
-    ], key=['rowsize', 'M'])
+@triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [32, 128, 1024], 
+                                            "BLOCK_SIZE_M": [8, 16, 32], 
+                                            "SPLIT_N": [4, 8, 16]}, None, None, num_warps=4, pre_hook=_zero_output), 
+                 key=['rowsize', 'M', 'idx_size'])
 @triton.jit
 def embed_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
                 dout_ptr,  # ptr to the dout vector
@@ -612,41 +610,49 @@ def embed_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
                 rowsize,    # row size. should be stride[0] of the 2d embedding matrix
                 M, idx_size, # sizes of the vectors
                 seed,   # seed for the generated tensor
-                BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_M: tl.constexpr):
+                BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, SPLIT_N: tl.constexpr):
     """
-    Backward pass of the embedding kernel. Unfortunately since both BLOCK_SIZE_IDX and BLOCK_SIZE_ROW operate on the n-dim, and any row of n-dim must
-    be processed by one pid/block because of the accumulation dot product, there is no point in splitting that dimension further into smaller blocks.
-    TODO: also split-k optimization
+    Backward pass of the embedding kernel. Implements split-n coalesced loads.
     """
     # identifies correct memory address of the part of the dcoef vector we are writing to
-    pid = tl.program_id(0)
-    offs_m = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    mask = offs_m < M
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    mask_m = offs_m < M
+     
+    # start at first block to load
+    pid_n = tl.program_id(1)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)    
+    # these are just compiler hints, note multiple_of documentation is wrong, ref: https://github.com/triton-lang/triton/issues/1324
+    offs_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_SIZE_N), BLOCK_SIZE_N)
     
+    # size of each coalesced load
+    LOAD_SIZE = BLOCK_SIZE_N * SPLIT_N
+    N = idx_size * rowsize
     # iterate along N-dim (of the "transposed" noise matrix)
     accumulator = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
-    # N = idx_size * rowsize
-    for i in range(0, idx_size):
-        idx = tl.load(idx_ptr + i)
-        for n in range(0, tl.cdiv(rowsize, BLOCK_SIZE_N)):
-            offs_n = n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-            
-            # squirrel5 noise function
-            mangledBits = squirrel5_gen_T(offs_m, idx * rowsize + offs_n, seed)   # [BLOCK_SIZE_M, BLOCK_SIZE_N]
-            
-            # mask off mangledBits that are > N, otherwise this will affect the final dot product
-            # we do this by masking off the respective coef that would elementwise multiply with the
-            # out of bounds mangledBits, thereby masking those out as well
-            mask_N = offs_n < rowsize
-            # load the subgroup of dout we are processing
-            dout = tl.load(dout_ptr + i * rowsize + offs_n, mask=mask_N)[None, :]  # [1, BLOCK_SIZE_N]
-            
-            # dot product via broadcast of elementwise multiplication of dout across M-dim of materialized noise matrix
-            # followed by summation along N-dim
-            accumulator += tl.sum(mangledBits * dout, axis=1) # [BLOCK_SIZE_M,]
-            
-    tl.store(dcoef_ptr + offs_m, accumulator, mask=mask)
-
+    for n in range(0, tl.cdiv(N, LOAD_SIZE)):
+        # should most often be a block of constant values denoting the offs for particular idx of the block, but at the boundary
+        # between blocks if rowsize % BLOCK_SIZE_N != 0 there will be different idxs.
+        offs_idx = offs_n // rowsize
+        idx = tl.load(idx_ptr + offs_idx, mask=offs_idx < idx_size)
+        # squirrel5 noise function, the correct offs_n should be idx + offs relative for that idx, not offs_n from the dout_ptr, hence % rowsize
+        mangledBits = squirrel5_gen_T(offs_m, idx * rowsize + (offs_n % rowsize), seed)   # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+        
+        # mask off mangledBits that are > N, otherwise this will affect the final dot product
+        # we do this by masking off the respective coef that would elementwise multiply with the
+        # out of bounds mangledBits, thereby masking those out as well
+        mask_N = offs_n < N 
+        # load the subgroup of dout we are processing
+        dout = tl.load(dout_ptr + offs_n, mask=mask_N)[None, :]  # [1, BLOCK_SIZE_N]
+        
+        # dot product via broadcast of elementwise multiplication of dout across M-dim of materialized noise matrix
+        # followed by summation along N-dim
+        accumulator += tl.sum(mangledBits * dout, axis=1) # [BLOCK_SIZE_M,]
+        # jump to next block to load
+        offs_n += LOAD_SIZE
+        
+    accumulator = accumulator.to(dcoef_ptr.dtype.element_ty)
+    tl.atomic_add(dcoef_ptr + offs_m, accumulator, mask=mask_m, sem="relaxed")
 
 @triton_op("randumblib::embed_fwd", mutates_args={})
 def embed_fwd(idx: torch.Tensor, coefs: torch.Tensor, rowsize: int, seed: int) -> torch.Tensor:
@@ -659,7 +665,7 @@ def embed_fwd(idx: torch.Tensor, coefs: torch.Tensor, rowsize: int, seed: int) -
 def embed_bwd(idx: torch.Tensor, dout: torch.Tensor, dcoefs_size: int, rowsize: int, seed: int) -> torch.Tensor:
     # note to self: should we enforce dout to be a flattened tensor? it doesn't seem to be necessary
     dcoefs = torch.empty(size=(dcoefs_size,), device=dout.device)
-    grid = lambda meta: (triton.cdiv(dcoefs_size, meta['BLOCK_SIZE_M']), ) 
+    grid = lambda meta: (triton.cdiv(dcoefs_size, meta['BLOCK_SIZE_M']), meta['SPLIT_N']) 
     wrap_triton(embed_bwd_kernel)[grid](dcoefs, dout, idx, rowsize, dcoefs_size, idx.numel(), seed)
     return dcoefs
 
