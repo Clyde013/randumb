@@ -78,6 +78,13 @@ def init_kaiming_uniform(weight: RandumbTensor, bias: Optional[RandumbTensor], s
         with torch.no_grad():
             bias._coef.uniform_(-bound, bound, generator=generator)
 
+def init_zeros(weight: RandumbTensor, bias: Optional[RandumbTensor]) -> None:
+    with torch.no_grad():
+        weight._coef.zero_()
+        # similar for bias
+        if bias is not None:
+            bias._coef.zero_()
+
 
 class SillyModuleMixin(nn.Module):
     """
@@ -97,7 +104,7 @@ class SillyModuleMixin(nn.Module):
                 # parameters are updated first whenever ._apply() is called, so recreating buffers will always have the rt._coef of correct dtype and device without us having to explicitly
                 # pass them in. Note that since we are creating an entirely new RT instead of dispatching to aten._to_copy, the view_ops has to be manually copied
                 # in case there were any view_ops applied onto the tensor before the ._apply(). While this should not be the case, it's better to be safe.
-                new_rt = CreateRandumbTensor(inp._coef, inp.seed, inp.shape)
+                new_rt = CreateRandumbTensor(inp._coef, inp.seed, inp.shape, inp.scale_bias, inp.fused_bias)
                 new_rt.view_ops = inp.view_ops
                 new_rt._init_shape = inp._init_shape
                 return new_rt
@@ -105,6 +112,31 @@ class SillyModuleMixin(nn.Module):
                 return fn(inp)
         super()._apply(wrapped_fn)
         return self
+
+    def init_rt_scale_bias(self, val = 0):
+        for name, buf in self.named_buffers():
+            if isinstance(buf, RandumbTensor):
+                buf.scale_bias = nn.Parameter(torch.tensor([val], dtype=buf.dtype, device=buf.device))
+                self.register_parameter(f"{name}_scale_bias", buf.scale_bias)
+                
+    def init_zero_coef_uniform_bias(self):
+        # this init scheme will set the coef vectors to zero and correctly scale the uniformly init biases
+        a: float = math.sqrt(5)
+        mode: str = "fan_in"
+        nonlinearity: str = "leaky_relu"
+        fan_in = _calculate_correct_fan(self.weight, mode)
+        gain = calculate_gain(nonlinearity, a)
+        std = gain / math.sqrt(fan_in)
+        bound = math.sqrt(3.0) * std
+        # the biases are initially -1 to 1, so we scale them by factor of bound
+        self.init_rt_scale_bias(bound)
+        init_zeros(self.weight, self.bias)
+        
+    def init_uniform_coef_zero_bias(self):
+        # this init scheme will correctly scale the uniformly coefs and init the biases to zero with 0 scale_bias factor
+        self.init_rt_scale_bias(0)
+        init_kaiming_uniform(self.weight, self.bias, self.seed[0])
+        
 
 
 class SillyLinear(SillyModuleMixin, nn.Module):
@@ -151,12 +183,14 @@ class SillyLinear(SillyModuleMixin, nn.Module):
         int_dim: Union[list[int], Generator],
         seed: Union[list[int], Generator],
         bias: bool = True,
+        rt_bias: bool = False,
         device=None,
         dtype=None,
     ) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.rt_bias = rt_bias
         
         # accept both generator and just the list of int_dim/seeds
         if isinstance(int_dim, GeneratorType):
@@ -170,19 +204,21 @@ class SillyLinear(SillyModuleMixin, nn.Module):
         
         self.weight_coef = nn.Parameter(torch.empty(self.int_dim[0], dtype=dtype, device=device), requires_grad=True)
         # self.weight = CreateRandumbTensor(self.weight_coef, self.seed[0], (out_features, in_features))
-        self.register_buffer("weight", CreateRandumbTensor(self.weight_coef, self.seed[0], (out_features, in_features)))
+        self.register_buffer("weight", CreateRandumbTensor(self.weight_coef, self.seed[0], (out_features, in_features), fused_bias=self.rt_bias))
         
         if bias:
             self.bias_coef = nn.Parameter(torch.empty(self.int_dim[1], dtype=dtype, device=device), requires_grad=True)
             # self.bias = CreateRandumbTensor(self.bias_coef, self.seed[1], (out_features, ))
-            self.register_buffer("bias", CreateRandumbTensor(self.bias_coef, self.seed[1], (out_features, )))
+            self.register_buffer("bias", CreateRandumbTensor(self.bias_coef, self.seed[1], (out_features, ), fused_bias=self.rt_bias))
         else:
             self.bias = None
             
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        init_kaiming_uniform(self.weight, self.bias, self.seed[0])
+        # init_kaiming_uniform(self.weight, self.bias, self.seed[0])
+        # init_zeros(self.weight, self.bias)
+        self.init_zero_coef_uniform_bias()
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return F.linear(input, self.weight, self.bias)
@@ -213,6 +249,7 @@ class SillyConv2d(SillyModuleMixin, nn.Conv2d):
         dilation: _size_2_t = 1,
         groups: int = 1,
         bias: bool = True,
+        rt_bias: bool = False,
         padding_mode: str = "zeros",
         device=None,
         dtype=None,
@@ -226,7 +263,7 @@ class SillyConv2d(SillyModuleMixin, nn.Conv2d):
             self.seed = [next(seed) for i in range(self.num_seeds)]
         else:
             self.seed = seed
-
+        self.rt_bias = rt_bias
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(
             in_channels,
@@ -246,23 +283,20 @@ class SillyConv2d(SillyModuleMixin, nn.Conv2d):
         self.weight_coef = nn.Parameter(torch.empty(self.int_dim[0], dtype=self.weight.dtype, device=self.weight.device), requires_grad=True)
         weight_shape = self.weight.shape
         del self.weight
-        self.register_buffer("weight", CreateRandumbTensor(coefs=self.weight_coef, seed=self.seed[0], shape=weight_shape))
+        self.register_buffer("weight", CreateRandumbTensor(coefs=self.weight_coef, seed=self.seed[0], shape=weight_shape, fused_bias=self.rt_bias))
         
         if self.bias is not None:
             self.bias_coef = nn.Parameter(torch.empty(self.int_dim[1], dtype=self.bias.dtype, device=self.bias.device), requires_grad=True)
             bias_shape = self.bias.shape
             del self.bias
-            self.register_buffer("bias", CreateRandumbTensor(coefs=self.bias_coef, seed=self.seed[1], shape=bias_shape))
-        
-        init_kaiming_uniform(self.weight, self.bias, self.seed[0])
-        # init_zeros(self.weight, self.bias)
+            self.register_buffer("bias", CreateRandumbTensor(coefs=self.bias_coef, seed=self.seed[1], shape=bias_shape, fused_bias=self.rt_bias))
+            
+        self.init_zero_coef_uniform_bias()
 
     def extra_repr(self) -> str:
         return f"int_dim={self.int_dim}, seeds={self.seed}"
 
 
-# TODO: can probably create a custom kernel that fast lookups the indices, instead of materializing the whole thing and relying
-# on the builtin aten embedding fwd and bwd (https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/Embedding.cpp)
 class SillyEmbedding(SillyModuleMixin, nn.Embedding):
     """
     Adapted from https://github.com/pytorch/pytorch/blob/v2.6.0/torch/nn/modules/sparse.py#L15
@@ -277,6 +311,7 @@ class SillyEmbedding(SillyModuleMixin, nn.Embedding):
         embedding_dim: int,
         int_dim: Union[list[int], Generator],
         seed: Union[list[int], Generator],
+        rt_bias: bool = False,
         padding_idx: Optional[int] = None,
         max_norm: Optional[float] = None,
         norm_type: float = 2.0,
@@ -291,7 +326,7 @@ class SillyEmbedding(SillyModuleMixin, nn.Embedding):
         super(nn.Embedding, self).__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
-        
+        self.rt_bias = rt_bias
         # accept both generator and just the list of int_dim/seeds
         if isinstance(int_dim, GeneratorType):
             self.int_dim = [next(int_dim) for i in range(self.num_seeds)]
@@ -318,13 +353,15 @@ class SillyEmbedding(SillyModuleMixin, nn.Embedding):
             ], f"Shape of weight {_weight.shape} does not match num_embeddings and embedding_dim"
             self.register_buffer("weight", _weight)
             self.weight_coef = self.weight._coef
-
+            
         self.sparse = sparse
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return embed_fwd(input, self.weight_coef, self.embedding_dim, self.weight.seed)
 
     def reset_parameters(self) -> None:
+        if self.rt_bias:
+            self.init_rt_scale_bias()
         init_kaiming_uniform(self.weight, None, seed=self.seed[0])
         # self._fill_padding_idx_with_zero()
         

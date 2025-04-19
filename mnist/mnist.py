@@ -1,4 +1,5 @@
 # adapted from https://github.com/pytorch/examples/blob/main/mnist/main.py
+# run from base directory with `python -m mnist.mnist`
 import os
 
 
@@ -46,7 +47,7 @@ class Net(nn.Module):
 class CastedLinear(SillyLinear):
 
     def __init__(self, in_features, out_features, int_dim_gen, seed_gen):
-        super().__init__(in_features, out_features, int_dim_gen, seed_gen, bias=False)
+        super().__init__(in_features, out_features, int_dim_gen, seed_gen, bias=False, rt_bias=True)
 
     def forward(self, x):
         return F.linear(x, self.weight.to(x.dtype))
@@ -54,9 +55,9 @@ class CastedLinear(SillyLinear):
 class SillyNet(nn.Module):
     def __init__(self, int_dim_gen, seed_gen):
         super(SillyNet, self).__init__()
-        self.conv1 = SillyConv2d(1, 32, int_dim=int_dim_gen, seed=seed_gen, kernel_size=3, stride=1)
+        self.conv1 = SillyConv2d(1, 32, int_dim=int_dim_gen, seed=seed_gen, kernel_size=3, stride=1, rt_bias=True)
         #self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, device="cuda")
-        self.conv2 = SillyConv2d(32, 64, int_dim=int_dim_gen, seed=seed_gen, kernel_size=3, stride=1)
+        self.conv2 = SillyConv2d(32, 64, int_dim=int_dim_gen, seed=seed_gen, kernel_size=3, stride=1, rt_bias=True)
         # self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, device="cuda")
         self.dropout1 = nn.Dropout(0.25)
         self.dropout2 = nn.Dropout(0.5)
@@ -104,7 +105,14 @@ def train(args, model, device, train_loader, optimizer, epoch, train_losses):
                 100. * batch_idx / len(train_loader), loss.item()))
             
             train_losses.append(loss.detach().item())
-            if args.wandb: wandb.log({"train_loss": loss.detach().item()})
+            if args.wandb:
+                # log the scale_bias terms
+                log_dict = {}
+                for name, buf in model.named_parameters():
+                    if name.endswith("_scale_bias"):
+                        log_dict[name] = buf.detach().item()
+                log_dict["train_loss"] = loss.detach().item()
+                wandb.log(log_dict)
             if args.dry_run:
                 break
 
@@ -130,8 +138,8 @@ def test(args, model, device, test_loader, test_accs):
 
 
 def main():
-    import lovely_tensors as lt
-    lt.monkey_patch()
+    # import lovely_tensors as lt
+    # lt.monkey_patch()
     # Training settings
     parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
     parser.add_argument('--batch-size', type=int, default=64, metavar='N',
@@ -242,7 +250,7 @@ def main():
             # else:
             #     print("1d xavier")
             #     nn.init.normal_(param)
-            lt.plot(param, center="mean").fig.savefig(f"{os.path.abspath(os.path.dirname(__file__))}/weight_dists/rand_model_leakyrelu/{name}.png")
+            # lt.plot(param, center="mean").fig.savefig(f"{os.path.abspath(os.path.dirname(__file__))}/weight_dists/rand_model_leakyrelu/{name}.png")
 
     for buf in model.buffers():
         print(type(buf), buf.size(), buf.device)

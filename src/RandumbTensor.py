@@ -69,13 +69,13 @@ def construct_configs(cfgs: dict, min_blocks: int, max_blocks: int, *args, **kwa
 	return configs
 
 
-# the following is a standalone helper kernel implementation, used mainly for crosschecking correctness of the more complex implementations
+# the following are standalone helper kernel implementations, used mainly for crosschecking correctness of the more complex implementations
 @triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [2**i for i in range(2, 8)], 
                                             "BLOCK_SIZE_M": [2**i for i in range(2, 8)]}, 4 * 64, None, num_warps=4),
                  key=['N', 'M']
 )
 @triton.jit
-def squirrel5_kernel(out_ptr,    # ptr to output vector (N, M)
+def squirrel5_kernel_2d(out_ptr,    # ptr to output vector (N, M)
                 N, M,   # sizes of the vectors
                 seed,   # seed for the generated tensor
                 stride_n, stride_m,
@@ -92,21 +92,36 @@ def squirrel5_kernel(out_ptr,    # ptr to output vector (N, M)
     mask = (offs_n < N)[:, None] & (offs_m < M)[None, :]
     
     # squirrel5 noise function
-    mangledBits = squirrel5_gen(offs_m, offs_n, seed)   # [BLOCK_SIZE_N, BLOCK_SIZE_M]
+    mangledBits = squirrel5_gen_2d(offs_m, offs_n, seed)   # [BLOCK_SIZE_N, BLOCK_SIZE_M]
     out_ptrs = out_ptr + stride_n * offs_n[:, None] + stride_m * offs_m[None, :]
     
     tl.store(out_ptrs, mangledBits, mask=mask)
 
-def squirrel5_generate(N, M, seed=1337):
+def squirrel5_generate_2d(N, M, seed=1337):
     output = torch.empty(size=(N, M), device='cuda')
     grid = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE_N']), triton.cdiv(M, meta['BLOCK_SIZE_M']))
-    squirrel5_kernel[grid](output, N, M, seed, output.stride(0), output.stride(1))
+    squirrel5_kernel_2d[grid](output, N, M, seed, output.stride(0), output.stride(1))
+    return output
+
+@triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [2**i for i in range(2, 8)]}, None, None, num_warps=4), key=['N'])
+@triton.jit
+def squirrel5_kernel_1d(out_ptr, N, seed, BLOCK_SIZE_N: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    mask = offs < N
+    mangledBits = squirrel5_gen_1d(offs, seed)
+    tl.store(out_ptr + offs, mangledBits, mask=mask)
+
+def squirrel5_generate_1d(N, seed=1337):
+    output = torch.empty(size=(N,), device="cuda")
+    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE_N"]),)
+    squirrel5_kernel_1d[grid](output, N, seed)
     return output
 
 
 # trition kernel implementations for the tensor
 @triton.jit
-def squirrel5_gen(cols: tl.tensor, rows: tl.tensor, seed):
+def squirrel5_gen_2d(cols: tl.tensor, rows: tl.tensor, seed):
     """    
     rows is an array of indices expected from leading n-dim. Indices of the rows of the noise matrix we are generating.
     cols is an array of indices expected from trailing m-dim. Indices of the columns of the noise matrix we are generating.
@@ -141,9 +156,9 @@ def squirrel5_gen(cols: tl.tensor, rows: tl.tensor, seed):
     return mangledBits
 
 @triton.jit
-def squirrel5_gen_T(cols: tl.tensor, rows: tl.tensor, seed):
+def squirrel5_gen_2d_T(cols: tl.tensor, rows: tl.tensor, seed):
     """    
-    Transposed variation of the squirrel5_gen algorithm, utilised in the backward pass. Note the transposition of the n, m matrices in the rows & cols definition below.
+    Transposed variation of the squirrel5_gen_2d algorithm, utilised in the backward pass. Note the transposition of the n, m matrices in the rows & cols definition below.
     
     rows is an array of indices expected from leading m-dim. Indices of the rows of the transposed noise matrix we are generating.
     cols is an array of indices expected from trailing n-dim. Indices of the columns of the transposed noise matrix we are generating.
@@ -177,14 +192,48 @@ def squirrel5_gen_T(cols: tl.tensor, rows: tl.tensor, seed):
     mangledBits = ( ONE_OVER_MAX_INT * mangledBits.to(tl.int32).to(tl.float32) ).to(tl.float32)
     return mangledBits
 
-@triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [2**i for i in range(8, 11)],
-                                            "BLOCK_SIZE_M": [2**i for i in range(2, 8)]}, None, None, num_warps=4),
+
+@triton.jit
+def squirrel5_gen_1d(idx: tl.tensor, seed):
+    """    
+    1d version. only idx, self-explanatory. used for the fused random bias.
+    """
+    # squirrel noise constants
+    SQ5_BIT_NOISE1: tl.constexpr = 0xd2a80a3f	# 11010010101010000000101000111111
+    SQ5_BIT_NOISE2: tl.constexpr = 0xa884f197	# 10101000100001001111000110010111
+    SQ5_BIT_NOISE3: tl.constexpr = 0x6C736F4B # 01101100011100110110111101001011
+    SQ5_BIT_NOISE4: tl.constexpr = 0xB79F3ABB	# 10110111100111110011101010111011
+    SQ5_BIT_NOISE5: tl.constexpr = 0x1b56c4f5	# 00011011010101101100010011110101
+    
+    mangledBits = idx.to(tl.uint32)
+    mangledBits *= SQ5_BIT_NOISE1
+    mangledBits += seed
+    mangledBits ^= (mangledBits >> 9)
+    mangledBits += SQ5_BIT_NOISE2
+    mangledBits ^= (mangledBits >> 11)
+    mangledBits *= SQ5_BIT_NOISE3
+    mangledBits ^= (mangledBits >> 13)
+    mangledBits += SQ5_BIT_NOISE4
+    mangledBits ^= (mangledBits >> 15)
+    mangledBits *= SQ5_BIT_NOISE5 
+    mangledBits ^= (mangledBits >> 17)
+    
+    # rescale the noise vector between -1 and 1
+    ONE_OVER_MAX_INT: tl.constexpr = 1.0 / 0x7FFFFFFF
+    mangledBits = ( ONE_OVER_MAX_INT * mangledBits.to(tl.int32).to(tl.float32) )
+    return mangledBits
+
+
+#TODO: rand bias scaling coef. if the coef is a, then da = sum(grad_out * bias). most probably easier to write a separate bwd kernel for the da calculation.
+@triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [64, 256, 1024],
+                                            "BLOCK_SIZE_M": [8, 16, 32]}, None, None, num_warps=4),
                  key=['N', 'M'])
 @triton.jit
 def materialize_fwd_kernel(out_ptr,    # ptr to output vector
                 coef_ptr,  # ptr to the coefficients vector
                 N, M,   # sizes of the vectors
                 seed,   # seed for the generated tensor
+                scale_bias_ptr, RAND_BIAS: tl.constexpr,
                 BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_M: tl.constexpr):
     """
     Fused kernel utilizing squirrel5 noise function to materialize a (N,) sized output vector (that is later arbitrarily reshaped)
@@ -193,6 +242,8 @@ def materialize_fwd_kernel(out_ptr,    # ptr to output vector
     The noise function should lazily materialize the (N, M) matrix row by row (along N dim), each row getting fused dot product'd with
     the entire coef matrix, which should result in cache hits every time because the coef matrix should be perma loaded into SRAM.
     The resulting equation is:    noise @ coef = out
+    
+    RAND_BIAS=1 to add fused random bias, turning eqn into: noise @ coef + scale_bias * bias = out
     """
     # identifies correct memory address of the part of the output vector we are writing to
     pid = tl.program_id(0)
@@ -206,7 +257,7 @@ def materialize_fwd_kernel(out_ptr,    # ptr to output vector
         offs_m = m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         
         # squirrel5 noise function
-        mangledBits = squirrel5_gen(offs_m, offs_n, seed)   # [BLOCK_SIZE_N, BLOCK_SIZE_M]
+        mangledBits = squirrel5_gen_2d(offs_m, offs_n, seed)   # [BLOCK_SIZE_N, BLOCK_SIZE_M]
         
         # mask off mangledBits that are > M, otherwise this will affect the final dot product
         # we do this by masking off the respective coef that would elementwise multiply with the
@@ -219,8 +270,12 @@ def materialize_fwd_kernel(out_ptr,    # ptr to output vector
         # followed by summation along M-dim
         accumulator += tl.sum(mangledBits * coefs, axis=1)  # [BLOCK_SIZE_N,]
         
+    # add fused random bias
+    if RAND_BIAS == 1:
+        scale_bias = tl.load(scale_bias_ptr)
+        accumulator += scale_bias * squirrel5_gen_1d(offs_n, seed)
     tl.store(out_ptr + offs_n, accumulator, mask=mask)
-
+    
 
 # torch.empty() initialization needs to be zerod out since we use tl.atomic_add instead of tl.store
 def _zero_output(*args, **kwargs):
@@ -266,7 +321,7 @@ def materialize_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
     # n-th coalesced load of size BLOCK_SIZE_N * SPLIT_N
     for n in range(0, tl.cdiv(N, LOAD_SIZE)):
         # squirrel5 noise function
-        mangledBits = squirrel5_gen_T(offs_m, offs_n, seed)   # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+        mangledBits = squirrel5_gen_2d_T(offs_m, offs_n, seed)   # [BLOCK_SIZE_M, BLOCK_SIZE_N]
         
         # mask off mangledBits that are > N, otherwise this will affect the final dot product
         # we do this by masking off the respective coef that would elementwise multiply with the
@@ -286,10 +341,11 @@ def materialize_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
     tl.atomic_add(dcoef_ptr + offs_m, accumulator, mask=mask_m, sem="relaxed")
 
 @triton_op("randumblib::materialize_fwd", mutates_args={})
-def materialize_fwd(coefs: torch.Tensor, size: int, seed: int) -> torch.Tensor:
+def materialize_fwd(coefs: torch.Tensor, size: int, seed: int, scale_bias: torch.Tensor, fused_bias: bool) -> torch.Tensor:
+    assert not (fused_bias and scale_bias is None), "scale_bias not initialized but fused_bias is True"
     output = torch.empty(size=(size,), device=coefs.device)
     grid = lambda meta: (triton.cdiv(size, meta['BLOCK_SIZE_N']), )
-    wrap_triton(materialize_fwd_kernel)[grid](output, coefs, size, coefs.numel(), seed)
+    wrap_triton(materialize_fwd_kernel)[grid](output, coefs, size, coefs.numel(), seed, scale_bias, int(fused_bias))
     return output
 
 @triton_op("randumblib::materialize_bwd", mutates_args={})
@@ -301,25 +357,55 @@ def materialize_bwd(dout: torch.Tensor, dcoefs_size: int, seed: int) -> torch.Te
     wrap_triton(materialize_bwd_kernel)[grid](dcoefs, dout, dout.numel(), dcoefs_size, seed)
     return dcoefs
 
+# seperate backward pass to compute the grad for the scale_bias if it is used
+def _zero_output_scale_bias(*args, **kwargs):
+	args[0]["dbias_ptr"].zero_()
+@triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [2**i for i in range(8, 11)]}, None, None, num_warps=4, pre_hook=_zero_output_scale_bias), key=["N"])
+@triton.jit
+def scale_bias_bwd_kernel(dbias_ptr, dout_ptr, N, seed, BLOCK_SIZE_N: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    mask = offs < N
+    dout = tl.load(dout_ptr + offs, mask=mask)
+    accumulator = tl.sum(dout * squirrel5_gen_1d(offs, seed))
+    accumulator = accumulator.to(dbias_ptr.dtype.element_ty)
+    tl.atomic_add(dbias_ptr, accumulator, sem="relaxed")
+
+@triton_op("randumblib::scale_bias_bwd", mutates_args={})
+def scale_bias_bwd(dout: torch.Tensor, seed: int) -> torch.Tensor:
+    assert dout.is_contiguous(), "dout is not contiguous, backwards pass might give incorrect results."
+    dbias = torch.empty(size=(1,), device=dout.device)
+    grid = lambda meta: (triton.cdiv(dout.numel(), meta['BLOCK_SIZE_N']),)
+    wrap_triton(scale_bias_bwd_kernel)[grid](dbias, dout, dout.numel(), seed)
+    return dbias
+
+# note: the backward autograd registration here isn't intended to be called, all RTs are constructed via RandumbTensorConstructor which have their own backward function defined
 def _mat_backward(ctx, grad):
     dcoefs = materialize_bwd(grad, ctx.dcoefs_size, ctx.seed)
-    # only coefs needs grad, the rest are non-differentiable. function signature of fwd: coefs, size, seed
-    return dcoefs, None, None, None
+    dscale_bias = None
+    if ctx.fused_bias: dscale_bias = scale_bias_bwd(grad, ctx.seed)
+    # only coefs needs grad, the rest are non-differentiable. function signature of fwd: coefs, size, seed, scale_bias, fused_bias
+    return dcoefs, None, None, dscale_bias, None
 
 def _mat_setup_context(ctx, inputs, output):
-    coefs, size, seed = inputs
+    coefs, size, seed, scale_bias, fused_bias = inputs
     ctx.dcoefs_size = coefs.numel()
     ctx.seed = seed
+    ctx.fused_bias = fused_bias
 
 materialize_fwd.register_autograd(_mat_backward, setup_context=_mat_setup_context)
 
 @materialize_fwd.register_kernel("cpu")
-def _mat_fwd(coefs: torch.Tensor, size: int, seed: int):
+def _mat_fwd(coefs: torch.Tensor, size: int, seed: int, fused_bias: bool):
     raise NotImplementedError("Unsupported CPU implementation of materialize_fwd called.")
 
 @materialize_bwd.register_kernel("cpu")
 def _mat_bwd(dout: torch.Tensor, dcoefs_size: int, seed: int):
-    raise NotImplementedError("Unsupported CPU implementation of materialize_fwd called.")
+    raise NotImplementedError("Unsupported CPU implementation of materialize_bwd called.")
+
+@scale_bias_bwd.register_kernel("cpu")
+def _scale_bias_bwd(dout: torch.Tensor, seed: int):
+    raise NotImplementedError("Unsupported CPU implementation of scale_bias_bwd called.")
 
 
 class RandumbTensor(torch.Tensor):
@@ -351,13 +437,13 @@ class RandumbTensor(torch.Tensor):
     """
     
     @staticmethod
-    def __new__(cls, data: torch.Tensor, seed: int, shape: Union[tuple, torch.Size], view_ops: list = None):
+    def __new__(cls, data: torch.Tensor, seed: int, shape: Union[tuple, torch.Size], scale_bias: torch.Tensor, fused_bias: bool, view_ops: list = None):
         # Creating the wrapper will generally detach tensors from the autograd graph, ensure that the 
         # input does not require grad or not created inside autograd context (should be taken care of by constructor Function)
         assert not data.requires_grad or not torch.is_grad_enabled()
         return torch.Tensor._make_wrapper_subclass(cls, torch.Size(shape), device=data.device, dtype=data.dtype, requires_grad=False)
 
-    def __init__(self, data: torch.Tensor, seed: int, shape: Union[tuple, torch.Size], view_ops: list = []):
+    def __init__(self, data: torch.Tensor, seed: int, shape: Union[tuple, torch.Size], scale_bias: torch.Tensor, fused_bias: bool, view_ops: list = []):
         """
         Args:
             data (torch.Tensor): If `int`, represents intermediate/intrinsic dimension, and random coef
@@ -370,7 +456,9 @@ class RandumbTensor(torch.Tensor):
                 Defaults to 'cpu'.
             requires_grad (bool, optional): Requires grad. Defaults to False.
         """
-        self.seed = seed        
+        self.seed = seed
+        self.scale_bias = scale_bias
+        self.fused_bias = fused_bias        
         
         # initialise coefficient tensor from given data
         self._coef = data
@@ -402,7 +490,7 @@ class RandumbTensor(torch.Tensor):
     
     def get_noise_matrix(self) -> torch.Tensor:
         # helper function to materialize the standalone noise matrix, should only be used for debugging
-        true_noise_mat = squirrel5_generate(*self.noise_matrix_shape, self.seed)
+        true_noise_mat = squirrel5_generate_2d(*self.noise_matrix_shape, self.seed)
         return true_noise_mat
     
     def print_memory(self):
@@ -422,7 +510,7 @@ class RandumbTensor(torch.Tensor):
         # This should be outside the autograd computation graph already if ever called, but just in case we wrap it in torch.no_grad
         with torch.no_grad():
             # materializes the tensor, then reshape it appropriately. 
-            self._tensor = materialize_fwd(self._coef, self.noise_matrix_shape[0], self.seed).to(self.dtype).view(self._init_shape)
+            self._tensor = materialize_fwd(self._coef, self.noise_matrix_shape[0], self.seed, self.scale_bias, self.fused_bias).to(self.dtype).view(self._init_shape)
             
             # view_ops application, for if RandumbTensor had view/transpose etc. called
             for opset in self.view_ops:
@@ -480,7 +568,7 @@ class RandumbTensor(torch.Tensor):
                 with fake_mode:
                     fake = torch.empty(instance.shape)
                     fake = func(fake, *args[1:], **kwargs)
-                rt = RandumbTensor(instance._coef, instance.seed, fake.shape, view_ops)
+                rt = RandumbTensor(instance._coef, instance.seed, fake.shape, instance.scale_bias, instance.fused_bias, view_ops)
                 rt._init_shape = instance._init_shape
                 del fake
             return rt
@@ -503,14 +591,15 @@ class RandumbTensorConstructor(Function):
     Always use this function to construct a RandumbTensor, and do not construct one directly.
     """
     @staticmethod
-    def forward(ctx, coefs: torch.Tensor, seed: int, shape: Iterable) -> RandumbTensor:
+    def forward(ctx, coefs: torch.Tensor, seed: int, shape: Iterable, scale_bias: torch.Tensor, fused_bias: bool) -> RandumbTensor:
         if type(coefs) is torch.Tensor or torch.nn.Parameter:
             assert len(coefs.size()) == 1, f"Coefficient tensor must be 1D but received tensor of shape {coefs.size()}"
-            out = RandumbTensor(coefs, seed, shape)
+            out = RandumbTensor(coefs, seed, shape, scale_bias, fused_bias)
 
             ctx.dcoefs_size = coefs.numel()
             ctx.seed = seed
             ctx.dtype = out.dtype
+            ctx.fused_bias = fused_bias
             return out
         else:
             raise AssertionError(f"Expected coefs to be of type torch.Tensor, found {type(coefs)} instead.")
@@ -521,13 +610,16 @@ class RandumbTensorConstructor(Function):
         # .flatten() instead of .view() as no guarantee the bwd tensor is contiguous
         grad = grad.flatten()
         # run the actual bwd
-        dout = materialize_bwd(grad, ctx.dcoefs_size, ctx.seed).to(ctx.dtype)
-        return dout, None, None
+        dcoefs = materialize_bwd(grad, ctx.dcoefs_size, ctx.seed).to(ctx.dtype)
+        dscale_bias = None
+        if ctx.fused_bias: dscale_bias = scale_bias_bwd(grad, ctx.seed)
+        # only coefs needs grad, the rest are non-differentiable. function signature of fwd: coefs, size, seed, scale_bias, fused_bias
+        return dcoefs, None, None, dscale_bias, None
     
     @classmethod
-    def apply(cls, coefs: torch.Tensor, seed: int, shape: Iterable) -> RandumbTensor:
+    def apply(cls, coefs: torch.Tensor, seed: int, shape: Iterable, scale_bias: torch.Tensor = None, fused_bias: bool = False) -> RandumbTensor:
         # trivial override of the .apply signature that's actually `apply(cls, *args, **kwargs)` just to make typehinting work because it's annoying me
-        return super().apply(coefs, seed, shape)
+        return super().apply(coefs, seed, shape, scale_bias, fused_bias)
 
 # alias for the constructor, use this as `rt = CreateRandumbTensor(...)`
 CreateRandumbTensor = RandumbTensorConstructor.apply
@@ -567,7 +659,7 @@ def embed_fwd_kernel(out_ptr,   # ptr to output vector
     
     # usually non-contiguous memory reads would be extremely expensive, but since the noise matrix doesn't actually exist in memory, we can materialize
     # arbitrary non-contiguous row indices. So we compute [BLOCK_SIZE_IDX, BLOCK_SIZE_ROW], each entry in BLOCK_SIZE_IDX is the ptr locating the start of
-    # the row, then BLOCK_SIZE_ROW locates the specific chunk of the row that we are computing on. Then we flatten everything since squirrel5_gen accepts 1D input.
+    # the row, then BLOCK_SIZE_ROW locates the specific chunk of the row that we are computing on. Then we flatten everything since squirrel5_gen_2d accepts 1D input.
     offs_row = pid_row * BLOCK_SIZE_ROW + tl.arange(0, BLOCK_SIZE_ROW)
     offs_n = tl.ravel( (idxs * rowsize)[:, None] + offs_row[None, :] )
      
@@ -578,7 +670,7 @@ def embed_fwd_kernel(out_ptr,   # ptr to output vector
         offs_m = m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         
         # squirrel5 noise function
-        mangledBits = squirrel5_gen(offs_m, offs_n, seed)   # [BLOCK_SIZE_IDX * BLOCK_SIZE_ROW, BLOCK_SIZE_M]
+        mangledBits = squirrel5_gen_2d(offs_m, offs_n, seed)   # [BLOCK_SIZE_IDX * BLOCK_SIZE_ROW, BLOCK_SIZE_M]
         
         # mask off mangledBits that are > M, otherwise this will affect the final dot product
         # we do this by masking off the respective coef that would elementwise multiply with the
@@ -636,7 +728,7 @@ def embed_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
         offs_idx = offs_n // rowsize
         idx = tl.load(idx_ptr + offs_idx, mask=offs_idx < idx_size)
         # squirrel5 noise function, the correct offs_n should be idx + offs relative for that idx, not offs_n from the dout_ptr, hence % rowsize
-        mangledBits = squirrel5_gen_T(offs_m, idx * rowsize + (offs_n % rowsize), seed)   # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+        mangledBits = squirrel5_gen_2d_T(offs_m, idx * rowsize + (offs_n % rowsize), seed)   # [BLOCK_SIZE_M, BLOCK_SIZE_N]
         
         # mask off mangledBits that are > N, otherwise this will affect the final dot product
         # we do this by masking off the respective coef that would elementwise multiply with the
@@ -756,7 +848,7 @@ if __name__ == "__main__":
     true_coef = w1.detach().clone().to(DEVICE)
     true_coef.requires_grad_()
     n, m = torch.Size(output_shape).numel(), true_coef.size(0)
-    true_noise_mat = squirrel5_generate(n, m, seed)
+    true_noise_mat = squirrel5_generate_2d(n, m, seed)
 
     true_rt = (true_noise_mat @ true_coef).view(output_shape).view(2, 25).transpose(0, 1)
     print(f"checking truert equal rt {torch.allclose(x, true_rt)}")
