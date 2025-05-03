@@ -24,7 +24,7 @@ import os
 import itertools
 import math
 
-from src.utils import getBack
+from src.utils import getBack, no_dispatch
 os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 
 import torch
@@ -224,8 +224,7 @@ def squirrel5_gen_1d(idx: tl.tensor, seed):
     return mangledBits
 
 
-#TODO: rand bias scaling coef. if the coef is a, then da = sum(grad_out * bias). most probably easier to write a separate bwd kernel for the da calculation.
-@triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [64, 256, 1024],
+@triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [32, 64, 256, 1024],
                                             "BLOCK_SIZE_M": [8, 16, 32]}, None, None, num_warps=4),
                  key=['N', 'M'])
 @triton.jit
@@ -233,11 +232,14 @@ def materialize_fwd_kernel(out_ptr,    # ptr to output vector
                 coef_ptr,  # ptr to the coefficients vector
                 N, M,   # sizes of the vectors
                 seed,   # seed for the generated tensor
+                P, Q,	# final shape of output vector
+                stride_P, stride_Q, # strides of output vector
                 scale_bias_ptr, RAND_BIAS: tl.constexpr,
                 BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_M: tl.constexpr):
     """
-    Fused kernel utilizing squirrel5 noise function to materialize a (N,) sized output vector (that is later arbitrarily reshaped)
-    The out_ptr is the output vector of shape (N,)
+    Fused kernel utilizing squirrel5 noise function to materialize a N -> (P, Q) sized output vector. 
+    Will also work for 1d shaped (1, Q) dim vectors by setting stride_Q = 1.
+    The out_ptr is the output vector of shape (P, Q), N = P * Q
     The coef_ptr is the coefficient vector of shape (M,)
     The noise function should lazily materialize the (N, M) matrix row by row (along N dim), each row getting fused dot product'd with
     the entire coef matrix, which should result in cache hits every time because the coef matrix should be perma loaded into SRAM.
@@ -250,6 +252,12 @@ def materialize_fwd_kernel(out_ptr,    # ptr to output vector
     offs_n = pid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     mask = offs_n < N
     
+    # it is more efficient to write/tl.store contiguous indices of the matrix, but this means that the actual offs_n 
+    # will need more complicated computation if stride_Q != 1 (i.e. transposed matrix), instead we have to use:
+    # `(offs_n % Q) * stride_Q` computes strided offset within the row
+    # `(offs_n // Q) * stride_P` computes which row (P-dim) the element is on
+    sq_offs_n = (offs_n % Q) * stride_Q + (offs_n // Q) * stride_P
+    
     # iterate along M-dim. These aren't "true" blocks in the sense that computation for blocks is split between pids, all chunks of computation here
     # are done in the same pid/block, this is more like "phases" within a single block, beacuse we require value of the entire vector to compute the dot product.
     accumulator = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
@@ -257,7 +265,7 @@ def materialize_fwd_kernel(out_ptr,    # ptr to output vector
         offs_m = m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         
         # squirrel5 noise function
-        mangledBits = squirrel5_gen_2d(offs_m, offs_n, seed)   # [BLOCK_SIZE_N, BLOCK_SIZE_M]
+        mangledBits = squirrel5_gen_2d(offs_m, sq_offs_n, seed)   # [BLOCK_SIZE_N, BLOCK_SIZE_M]
         
         # mask off mangledBits that are > M, otherwise this will affect the final dot product
         # we do this by masking off the respective coef that would elementwise multiply with the
@@ -266,25 +274,27 @@ def materialize_fwd_kernel(out_ptr,    # ptr to output vector
         # load the subgroup of coefficients we are processing
         coefs = tl.load(coef_ptr + offs_m, mask=mask_M)[None, :]  # [1, BLOCK_SIZE_M]
         
-        # dot product via broadcast of elementwise multiplication of coeffs across N-dim of materialized noise matrix
+        # dot product via broadcast of elementwise multiplication of coefs across N-dim of materialized noise matrix
         # followed by summation along M-dim
         accumulator += tl.sum(mangledBits * coefs, axis=1)  # [BLOCK_SIZE_N,]
         
     # add fused random bias
     if RAND_BIAS == 1:
         scale_bias = tl.load(scale_bias_ptr)
-        accumulator += scale_bias * squirrel5_gen_1d(offs_n, seed)
+        accumulator += scale_bias * squirrel5_gen_1d(sq_offs_n, seed)
     tl.store(out_ptr + offs_n, accumulator, mask=mask)
     
+# TODO: while it's not an immediate concern, the gras that coef tensors have is extremely large for most normal model N values,
+# since the grads are additive and any small sized downproj dim will inevitably accumulate very big grad values (since grads summed along N-dim)
+# this might cause unstable training dynamics and could be the reason for the initial spike in loss that happens in most training runs.
 
 # torch.empty() initialization needs to be zerod out since we use tl.atomic_add instead of tl.store
-def _zero_output(*args, **kwargs):
+def _zero_output_coef(*args, **kwargs):
 	args[0]["dcoef_ptr"].zero_()
  
-
 @triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [2**i for i in range(8, 11)],
                                             "BLOCK_SIZE_M": [4, 16], 
-                                            "SPLIT_N": [4, 8, 16]}, None, None, num_warps=4, pre_hook=_zero_output),
+                                            "SPLIT_N": [4, 8, 16]}, None, None, num_warps=4, pre_hook=_zero_output_coef),
                  key=['N', 'M'])
 @triton.jit
 def materialize_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
@@ -302,6 +312,9 @@ def materialize_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
     simultaneously loads consecutive blocks during each for loop iteration. The N dimension is split into (BLOCK_SIZE_N * SPLIT_N) sized 
     coalesced loads, for a total number of N // (BLOCK_SIZE_N * SPLIT_N) loads. Each pid should process a separate BLOCK_SIZE_N block of 
     a particular load.
+    Unlike in the fwd pass, we don't actually have to care about the striding, because the dot product is performed along the n-dim on all 
+    elements of the RT, which means the specific order of elements doesn't matter since the summation of all dot products along n-dim is 
+    permutation-invariant.
     """
     # identifies correct memory address of the part of the dcoef vector we are writing to
     pid_m = tl.program_id(0)
@@ -340,15 +353,19 @@ def materialize_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
     accumulator = accumulator.to(dcoef_ptr.dtype.element_ty)
     tl.atomic_add(dcoef_ptr + offs_m, accumulator, mask=mask_m, sem="relaxed")
 
-@triton_op("randumblib::materialize_fwd", mutates_args={})
-def materialize_fwd(coefs: torch.Tensor, size: int, seed: int, scale_bias: torch.Tensor, fused_bias: bool) -> torch.Tensor:
+@triton_op("rten::materialize_fwd", mutates_args={})
+def materialize_fwd(coefs: torch.Tensor, size: list[int], strides: list[int], seed: int, scale_bias: torch.Tensor, fused_bias: bool) -> torch.Tensor:
     assert not (fused_bias and scale_bias is None), "scale_bias not initialized but fused_bias is True"
-    output = torch.empty(size=(size,), device=coefs.device)
-    grid = lambda meta: (triton.cdiv(size, meta['BLOCK_SIZE_N']), )
-    wrap_triton(materialize_fwd_kernel)[grid](output, coefs, size, coefs.numel(), seed, scale_bias, int(fused_bias))
+    output = torch.empty(size=size, device=coefs.device)
+    if len(size) == 1:
+        size = (1, size[0])
+        strides = (0, strides[0])
+    N = size[0] * size[1]
+    grid = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE_N']), )
+    materialize_fwd_kernel[grid](output, coefs, N, coefs.numel(), seed, *size, *strides, scale_bias, int(fused_bias))
     return output
 
-@triton_op("randumblib::materialize_bwd", mutates_args={})
+@triton_op("rten::materialize_bwd", mutates_args={})
 def materialize_bwd(dout: torch.Tensor, dcoefs_size: int, seed: int) -> torch.Tensor:
     # note to self: should we enforce dout to be a flattened tensor? it doesn't seem to be necessary
     assert dout.is_contiguous(), "dout is not contiguous, backwards pass might give incorrect results."
@@ -360,6 +377,7 @@ def materialize_bwd(dout: torch.Tensor, dcoefs_size: int, seed: int) -> torch.Te
 # seperate backward pass to compute the grad for the scale_bias if it is used
 def _zero_output_scale_bias(*args, **kwargs):
 	args[0]["dbias_ptr"].zero_()
+ 
 @triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [2**i for i in range(8, 11)]}, None, None, num_warps=4, pre_hook=_zero_output_scale_bias), key=["N"])
 @triton.jit
 def scale_bias_bwd_kernel(dbias_ptr, dout_ptr, N, seed, BLOCK_SIZE_N: tl.constexpr):
@@ -371,7 +389,7 @@ def scale_bias_bwd_kernel(dbias_ptr, dout_ptr, N, seed, BLOCK_SIZE_N: tl.constex
     accumulator = accumulator.to(dbias_ptr.dtype.element_ty)
     tl.atomic_add(dbias_ptr, accumulator, sem="relaxed")
 
-@triton_op("randumblib::scale_bias_bwd", mutates_args={})
+@triton_op("rten::scale_bias_bwd", mutates_args={})
 def scale_bias_bwd(dout: torch.Tensor, seed: int) -> torch.Tensor:
     assert dout.is_contiguous(), "dout is not contiguous, backwards pass might give incorrect results."
     dbias = torch.empty(size=(1,), device=dout.device)
@@ -412,7 +430,6 @@ class RandumbTensor(torch.Tensor):
     """
     This is a structured tensor representation that is constructed via the fused matmul of two tensors, tensor A that is generated 
     via prng function and tensor B, a trainable coefficient tensor. Tensor A has shape (n, int_dim). Tensor B has shape (int_dim,).
-    The output tensor will be reshaped into an arbitrary shape where n is the number of elements.
     
     This custom tensor subclass should be usable anywhere, however when utilising it inside nn.Module, remember to register
     the _coef tensor as a parameter of the module, and the RandumbTensor itself as a buffer via `register_buffer` for any
@@ -422,14 +439,14 @@ class RandumbTensor(torch.Tensor):
     Always instantiate a RandumbTensor via the RandumbTensorConstructor, this ensures that the gradients will be properly backpropagated
     to the coeficient tensor. 
     
-    There is a slightly complicated "lazy" view materialization, it works by intercepting any torch_dispatch 
-    to view/transpose/etc. ops called on the RT, and returns another RT instance with the intercepted op appended to view_ops. 
-    During materialization, the view ops in view_ops are sequentially called again, but this also has overhead from recreating views every
-    call, making views of RTs magnitudes slower if comparing to normal tensor views, which are usually created once and then cached, 
-    so use sparingly and with caution. If possible, create with original shape and no view_ops applied to it.
+    There is a slightly complicated "lazy" view materialization, it works by intercepting any torch_dispath to view/transpose/etc. ops 
+    (defined by OVERRIDE_VIEW_OPS) called on the RT, and returns another RT instance with correctly updated shape and stride information 
+    (used in materialization kernel). The shape and stride information is collected by simulating the view op through a faketensor, and 
+    if any view ops that are incompatible with the current RT's size and stride is called, it will throw an error through faketensormode.
     
     While coef will work with bfloat16, float16 and float32, and the variable of self.dtype follows the coef.dtype, take note that
-    the final output of the materialization kernel will be upcasted to float32. If .to() is utilized to cast the output dtype, then it will be added to view_ops.
+    the final output of the materialization kernel will be upcasted to float32. If .to() is utilized to cast the output dtype, then it will be 
+    treated as view_ops under _to_copy().
     
     Integration with torch compile is not supported, there is no guarantee that torch compile will not create a model with a memory leak
     due to it compiling a graph that holds references to _tensor - this is the case for the modded-nanogpt implementation. 
@@ -437,13 +454,15 @@ class RandumbTensor(torch.Tensor):
     """
     
     @staticmethod
-    def __new__(cls, data: torch.Tensor, seed: int, shape: Union[tuple, torch.Size], scale_bias: torch.Tensor, fused_bias: bool, view_ops: list = None):
+    def __new__(cls, data: torch.Tensor, seed: int, shape: Union[tuple, torch.Size], scale_bias: torch.Tensor, fused_bias: bool, strides: tuple[int] = None):
         # Creating the wrapper will generally detach tensors from the autograd graph, ensure that the 
         # input does not require grad or not created inside autograd context (should be taken care of by constructor Function)
         assert not data.requires_grad or not torch.is_grad_enabled()
-        return torch.Tensor._make_wrapper_subclass(cls, torch.Size(shape), device=data.device, dtype=data.dtype, requires_grad=False)
+        kwargs = {}
+        if strides is not None: kwargs["strides"] = strides
+        return torch.Tensor._make_wrapper_subclass(cls, torch.Size(shape), device=data.device, dtype=data.dtype, requires_grad=False, **kwargs)
 
-    def __init__(self, data: torch.Tensor, seed: int, shape: Union[tuple, torch.Size], scale_bias: torch.Tensor, fused_bias: bool, view_ops: list = []):
+    def __init__(self, data: torch.Tensor, seed: int, shape: Union[tuple, torch.Size], scale_bias: torch.Tensor, fused_bias: bool, strides: tuple[int] = None):
         """
         Args:
             data (torch.Tensor): If `int`, represents intermediate/intrinsic dimension, and random coef
@@ -458,7 +477,7 @@ class RandumbTensor(torch.Tensor):
         """
         self.seed = seed
         self.scale_bias = scale_bias
-        self.fused_bias = fused_bias        
+        self.fused_bias = fused_bias
         
         # initialise coefficient tensor from given data
         self._coef = data
@@ -470,15 +489,10 @@ class RandumbTensor(torch.Tensor):
         self._tensor: torch.Tensor = None
         # shape of the prng generated tensor (that should never be fully materialised)
         self.noise_matrix_shape = torch.Size((self.shape.numel(), self.int_dim))
-        
-        # sequence of view ops to apply to the materialized _tensor
-        self.view_ops = view_ops
-        # this should be overridden by any view_ops after init to maintain the original, unmodified shape for the first .view() operation in materialize()
-        self._init_shape = shape
     
     def __repr__(self):
         with torch._C._DisableTorchDispatch():
-            return f"RandumbTensor(seed={self.seed}, int_dim={self.int_dim}, shape={self.shape}, noise_matrix_shape={self.noise_matrix_shape}, dtype={self.dtype}, device='{self.device}', coef={self._coef})"
+            return f"RandumbTensor(seed={self.seed}, int_dim={self.int_dim}, shape={self.shape}, stride={self.stride()}, noise_matrix_shape={self.noise_matrix_shape}, dtype={self.dtype}, device='{self.device}')"
     
     def get_materialized(self) -> torch.Tensor:
         # helper function to materialize the full matrix, should only be used for debugging tbh, for all intents and purposes other than
@@ -510,19 +524,7 @@ class RandumbTensor(torch.Tensor):
         # This should be outside the autograd computation graph already if ever called, but just in case we wrap it in torch.no_grad
         with torch.no_grad():
             # materializes the tensor, then reshape it appropriately. 
-            self._tensor = materialize_fwd(self._coef, self.noise_matrix_shape[0], self.seed, self.scale_bias, self.fused_bias).to(self.dtype).view(self._init_shape)
-            
-            # view_ops application, for if RandumbTensor had view/transpose etc. called
-            for opset in self.view_ops:
-                op = opset[0]
-                # replace the RandumbTensor that is usually the first arg with self._tensor
-                args = opset[1][1:]
-                kwargs = opset[2]
-                # i don't understand it but, applying the torch_dispatch ops adds to the backwards graph of _tensor, which is convenient? 
-                # it doesn't seem to populate the grad_fn here though... so i'm honestly not sure *where* the computation graph is being constructed,
-                # but it sure is exceptionally convenient for me!
-                with torch._C._DisableTorchDispatch():
-                    self._tensor = op(self._tensor, *args, **kwargs)
+            self._tensor = materialize_fwd(self._coef, self.size(), self.stride(), self.seed, self.scale_bias, self.fused_bias).to(self.dtype)
 
     def dematerialize(self):
         # this function should free _tensor from memory. We can safely delete the entire tensor because the autograd computation is tracked manually by the
@@ -541,7 +543,10 @@ class RandumbTensor(torch.Tensor):
     __torch_function__ = torch._C._disabled_torch_function_impl
     # list of view ops that we intercept in torch_dispatch, should be easy to add support for any listed https://pytorch.org/docs/stable/tensor_view.html
     # full list of aten ops https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/native_functions.yaml
-    OVERRIDE_VIEW_OPS = [torch.ops.aten.view.default, torch.ops.aten.transpose.int, torch.ops.aten._to_copy.default, torch.ops.aten.t.default]
+    OVERRIDE_VIEW_OPS = [torch.ops.aten.view.default, torch.ops.aten.transpose.int, torch.ops.aten._to_copy.default, torch.ops.aten.t.default, torch.ops.aten.permute.default]
+    # As long as all the view ops performed on the RT are compatible with tensor's size and stride, we can simply alter the shape and stride accordingly and the 
+    # materialize_fwd accepting strides will work its magic. This means we also don't need to store lists of view ops, while faketensor will still throw an error
+    # if an illegal view_op is performed on a possibly non-contiguous tensor (i.e. Error like "view size is not compatible ... Call .contiguous() before .view().")
     
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
@@ -558,18 +563,15 @@ class RandumbTensor(torch.Tensor):
         # perform the operation with materialized tensors
         if func in cls.OVERRIDE_VIEW_OPS:
             instance: RandumbTensor = args[0]
-            view_ops = instance.view_ops[:]
-            view_ops.append((func, args, kwargs))
             with torch.no_grad():
                 # use faketensor to compute the final output shape, because we cannot change tensor.shape attribute once created, and if the output 
                 # shape doesn't match the grad that is returned in the bwd pass, then pytorch will throw an error.
                 fake_mode = detect_fake_mode(args)
                 if fake_mode is None: fake_mode = FakeTensorMode()
                 with fake_mode:
-                    fake = torch.empty(instance.shape)
+                    fake = torch.empty_strided(instance.shape, instance.stride())
                     fake = func(fake, *args[1:], **kwargs)
-                rt = RandumbTensor(instance._coef, instance.seed, fake.shape, instance.scale_bias, instance.fused_bias, view_ops)
-                rt._init_shape = instance._init_shape
+                rt = RandumbTensor(instance._coef, instance.seed, fake.shape, instance.scale_bias, instance.fused_bias, fake.stride())
                 del fake
             return rt
         else:
@@ -615,20 +617,16 @@ class RandumbTensorConstructor(Function):
         if ctx.fused_bias: dscale_bias = scale_bias_bwd(grad, ctx.seed)
         # only coefs needs grad, the rest are non-differentiable. function signature of fwd: coefs, size, seed, scale_bias, fused_bias
         return dcoefs, None, None, dscale_bias, None
-    
-    @classmethod
-    def apply(cls, coefs: torch.Tensor, seed: int, shape: Iterable, scale_bias: torch.Tensor = None, fused_bias: bool = False) -> RandumbTensor:
-        # trivial override of the .apply signature that's actually `apply(cls, *args, **kwargs)` just to make typehinting work because it's annoying me
-        return super().apply(coefs, seed, shape, scale_bias, fused_bias)
 
 # alias for the constructor, use this as `rt = CreateRandumbTensor(...)`
-CreateRandumbTensor = RandumbTensorConstructor.apply
+def CreateRandumbTensor(coefs: torch.Tensor, seed: int, shape: Iterable, scale_bias: torch.Tensor = None, fused_bias: bool = False) -> RandumbTensor:
+    return RandumbTensorConstructor.apply(coefs, seed, shape, scale_bias, fused_bias)
 
 
 # triton kernel implementation for the embedding layer
-@triton.autotune(configs=construct_configs({"BLOCK_SIZE_ROW": [128, 256, 1024],
-                                            "BLOCK_SIZE_M": [4, 16], 
-                                            "BLOCK_SIZE_IDX": [4, 16]}, None, None, num_warps=4), 
+@triton.autotune(configs=construct_configs({"BLOCK_SIZE_ROW": [256, 1024],
+                                            "BLOCK_SIZE_M": [16, 64], 
+                                            "BLOCK_SIZE_IDX": [16, 64]}, None, None, num_warps=4), 
                  key=['rowsize', 'M', 'idx_size'])
 @triton.jit
 def embed_fwd_kernel(out_ptr,   # ptr to output vector
@@ -693,7 +691,7 @@ def embed_fwd_kernel(out_ptr,   # ptr to output vector
 
 @triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [32, 128, 1024], 
                                             "BLOCK_SIZE_M": [8, 16, 32], 
-                                            "SPLIT_N": [4, 8, 16]}, None, None, num_warps=4, pre_hook=_zero_output), 
+                                            "SPLIT_N": [4, 8, 16]}, None, None, num_warps=4, pre_hook=_zero_output_coef), 
                  key=['rowsize', 'M', 'idx_size'])
 @triton.jit
 def embed_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
@@ -746,14 +744,14 @@ def embed_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
     accumulator = accumulator.to(dcoef_ptr.dtype.element_ty)
     tl.atomic_add(dcoef_ptr + offs_m, accumulator, mask=mask_m, sem="relaxed")
 
-@triton_op("randumblib::embed_fwd", mutates_args={})
+@triton_op("rten::embed_fwd", mutates_args={})
 def embed_fwd(idx: torch.Tensor, coefs: torch.Tensor, rowsize: int, seed: int) -> torch.Tensor:
     output = torch.empty(size=(*idx.shape, rowsize), device=coefs.device)
     grid = lambda meta: ( triton.cdiv(idx.numel(), meta['BLOCK_SIZE_IDX']), triton.cdiv(rowsize, meta['BLOCK_SIZE_ROW']), )
     wrap_triton(embed_fwd_kernel)[grid](output, coefs, idx, rowsize, coefs.numel(), idx.numel(), seed, output.stride(-2))
     return output
 
-@triton_op("randumblib::embed_bwd", mutates_args={})
+@triton_op("rten::embed_bwd", mutates_args={})
 def embed_bwd(idx: torch.Tensor, dout: torch.Tensor, dcoefs_size: int, rowsize: int, seed: int) -> torch.Tensor:
     # note to self: should we enforce dout to be a flattened tensor? it doesn't seem to be necessary
     dcoefs = torch.empty(size=(dcoefs_size,), device=dout.device)
