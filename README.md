@@ -49,10 +49,8 @@ Tangentially related that showed up on my Twitter feed: Zhong, Z. and Andreas, J
 
 Proof that this stupid idea isn't completely impossible: Aghajanyan, A., Zettlemoyer, L. and Gupta, S. (2020) ‘Intrinsic Dimensionality Explains the Effectiveness of Language Model Fine-Tuning’. arXiv. Available at: http://arxiv.org/abs/2012.13255
 
-OG LoRA paper actually inspired by intrinsic dimensionality: Zeng, Y. and Lee, K. (2024) ‘The Expressive Power of Low-Rank Adaptation’. Available at: https://doi.org/10.48550/arXiv.2310.17513.
+OG LoRA paper actually inspired by intrinsic dimensionality: Hu, E.J. et al. (2021) ‘LoRA: Low-Rank Adaptation of Large Language Models’. arXiv. Available at: https://doi.org/10.48550/arXiv.2106.09685.
 
 Probably useful: Gressmann, F., Eaton-Rosen, Z. and Luschi, C. (2020) ‘Improving Neural Network Training in Low Dimensional Random Bases’. arXiv. Available at: https://doi.org/10.48550/arXiv.2011.04720.
 
 Utilizing orthogonal random features for attention: Choromanski, K. et al. (2022) ‘Rethinking Attention with Performers’. arXiv. Available at: https://doi.org/10.48550/arXiv.2009.14794.
-
-
