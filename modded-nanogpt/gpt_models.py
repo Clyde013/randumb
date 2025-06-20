@@ -9,7 +9,7 @@ from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 flex_attention = torch.compile(flex_attention, dynamic=False)
 create_block_mask = torch.compile(create_block_mask, dynamic=False)
 
-from src.SillyLayers import SillyLinear, SillyEmbedding
+from rten_cpp.SillyLayers import SillyLinear, SillyEmbedding
 
 # -------------
 # normal gpt model

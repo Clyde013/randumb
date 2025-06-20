@@ -14,10 +14,10 @@ from torchvision import datasets, transforms
 from torch.optim.lr_scheduler import StepLR
 
 import wandb
-from src.SillyLayers import SillyLinear, SillyConv2d, stepgen
+from rten_cpp.SillyLayers import SillyLinear, SillyConv2d, stepgen
 
-from src.RandumbTensor import CreateRandumbTensor
-from src.utils import getBack
+from rten_cpp.RandumbTensor import CreateRandumbTensor
+from rten_cpp.utils import getBack
 
 class Net(nn.Module):
     def __init__(self):

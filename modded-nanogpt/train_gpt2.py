@@ -27,7 +27,7 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 sys.path.append("..")
-from src.SillyLayers import stepgen
+from rten_cpp.SillyLayers import stepgen
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
