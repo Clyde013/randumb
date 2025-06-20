@@ -1,10 +1,19 @@
 from typing import Optional, Callable, List
-
+import contextlib
 import torch
 
 device = "cpu"
 if torch.cuda.is_available():
    device = "cuda"
+
+# from https://github.com/albanD/subclass_zoo/blob/main/utils.py#L12
+@contextlib.contextmanager
+def no_dispatch():
+    guard = torch._C._DisableTorchDispatch()
+    try:
+        yield
+    finally:
+        del guard
 
 def _test_memory(
     func: Callable,

@@ -24,8 +24,13 @@ import os
 import itertools
 import math
 
-from src.utils import getBack, no_dispatch
+from .utils import getBack, no_dispatch
 os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
+# os.environ["TRITON_INTERPRET"] = "0"
+# os.environ["TRITON_ALWAYS_COMPILE"] = "1"
+
+# manual autotune flag. Will use the triton.autotune if set, otherwise manually pass in block sizes
+if "AUTOTUNE" not in os.environ: os.environ["AUTOTUNE"] = "1"
 
 import torch
 from torch.utils._pytree import tree_map, tree_map_only
@@ -70,10 +75,6 @@ def construct_configs(cfgs: dict, min_blocks: int, max_blocks: int, *args, **kwa
 
 
 # the following are standalone helper kernel implementations, used mainly for crosschecking correctness of the more complex implementations
-@triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [2**i for i in range(2, 8)], 
-                                            "BLOCK_SIZE_M": [2**i for i in range(2, 8)]}, 4 * 64, None, num_warps=4),
-                 key=['N', 'M']
-)
 @triton.jit
 def squirrel5_kernel_2d(out_ptr,    # ptr to output vector (N, M)
                 N, M,   # sizes of the vectors
@@ -103,7 +104,7 @@ def squirrel5_generate_2d(N, M, seed=1337):
     squirrel5_kernel_2d[grid](output, N, M, seed, output.stride(0), output.stride(1))
     return output
 
-@triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [2**i for i in range(2, 8)]}, None, None, num_warps=4), key=['N'])
+
 @triton.jit
 def squirrel5_kernel_1d(out_ptr, N, seed, BLOCK_SIZE_N: tl.constexpr):
     pid = tl.program_id(0)
@@ -111,6 +112,12 @@ def squirrel5_kernel_1d(out_ptr, N, seed, BLOCK_SIZE_N: tl.constexpr):
     mask = offs < N
     mangledBits = squirrel5_gen_1d(offs, seed)
     tl.store(out_ptr + offs, mangledBits, mask=mask)
+    
+if int(os.environ["AUTOTUNE"]): 
+    squirrel5_kernel_2d = triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [2**i for i in range(2, 8)],
+                                                                     "BLOCK_SIZE_M": [2**i for i in range(2, 8)]}, 4 * 64, None, num_warps=4),
+                                                                 key=['N', 'M'])(squirrel5_kernel_2d)
+    squirrel5_kernel_1d = triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [2**i for i in range(2, 8)]}, None, None, num_warps=4), key=['N'])(squirrel5_kernel_1d)
 
 def squirrel5_generate_1d(N, seed=1337):
     output = torch.empty(size=(N,), device="cuda")
@@ -137,6 +144,7 @@ def squirrel5_gen_2d(cols: tl.tensor, rows: tl.tensor, seed):
     SQ5_BIT_NOISE5: tl.constexpr = 0x1b56c4f5	# 00011011010101101100010011110101
     PRIME_NUMBER: tl.constexpr = 198491317 # Large prime number with non-boring bits
     
+    #TODO: this line causes long scoreboard warp stalls, but there's no L1 data access??
     mangledBits = (PRIME_NUMBER * rows.to(tl.uint32))[:, None] + cols.to(tl.uint32)[None, :]
     mangledBits *= SQ5_BIT_NOISE1
     mangledBits += seed
@@ -224,9 +232,6 @@ def squirrel5_gen_1d(idx: tl.tensor, seed):
     return mangledBits
 
 
-@triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [32, 64, 256, 1024],
-                                            "BLOCK_SIZE_M": [8, 16, 32]}, None, None, num_warps=4),
-                 key=['N', 'M'])
 @triton.jit
 def materialize_fwd_kernel(out_ptr,    # ptr to output vector
                 coef_ptr,  # ptr to the coefficients vector
@@ -260,7 +265,7 @@ def materialize_fwd_kernel(out_ptr,    # ptr to output vector
     
     # iterate along M-dim. These aren't "true" blocks in the sense that computation for blocks is split between pids, all chunks of computation here
     # are done in the same pid/block, this is more like "phases" within a single block, beacuse we require value of the entire vector to compute the dot product.
-    accumulator = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
+    accumulator = tl.zeros([BLOCK_SIZE_N], dtype=tl.float32)
     for m in range(0, tl.cdiv(M, BLOCK_SIZE_M)):
         offs_m = m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         
@@ -273,7 +278,7 @@ def materialize_fwd_kernel(out_ptr,    # ptr to output vector
         mask_M = offs_m < M
         # load the subgroup of coefficients we are processing
         coefs = tl.load(coef_ptr + offs_m, mask=mask_M)[None, :]  # [1, BLOCK_SIZE_M]
-        
+                
         # dot product via broadcast of elementwise multiplication of coefs across N-dim of materialized noise matrix
         # followed by summation along M-dim
         accumulator += tl.sum(mangledBits * coefs, axis=1)  # [BLOCK_SIZE_N,]
@@ -283,19 +288,19 @@ def materialize_fwd_kernel(out_ptr,    # ptr to output vector
         scale_bias = tl.load(scale_bias_ptr)
         accumulator += scale_bias * squirrel5_gen_1d(sq_offs_n, seed)
     tl.store(out_ptr + offs_n, accumulator, mask=mask)
-    
-# TODO: while it's not an immediate concern, the gras that coef tensors have is extremely large for most normal model N values,
+
+# TODO: while it's not an immediate concern, the grads that coef tensors have is extremely large for most normal model N values,
 # since the grads are additive and any small sized downproj dim will inevitably accumulate very big grad values (since grads summed along N-dim)
 # this might cause unstable training dynamics and could be the reason for the initial spike in loss that happens in most training runs.
 
 # torch.empty() initialization needs to be zerod out since we use tl.atomic_add instead of tl.store
 def _zero_output_coef(*args, **kwargs):
-	args[0]["dcoef_ptr"].zero_()
+    if isinstance(args[0], dict): 
+        args[0]["dcoef_ptr"].zero_()
+    else:
+        args[0].zero_()
+	
  
-@triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [2**i for i in range(8, 11)],
-                                            "BLOCK_SIZE_M": [4, 16], 
-                                            "SPLIT_N": [4, 8, 16]}, None, None, num_warps=4, pre_hook=_zero_output_coef),
-                 key=['N', 'M'])
 @triton.jit
 def materialize_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
                 dout_ptr,  # ptr to the dout vector
@@ -330,7 +335,7 @@ def materialize_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
     # size of each coalesced load
     LOAD_SIZE = BLOCK_SIZE_N*SPLIT_N
     # iterate along N-dim (of the "transposed" noise matrix)
-    accumulator = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
+    accumulator = tl.zeros([BLOCK_SIZE_M], dtype=tl.float32)
     # n-th coalesced load of size BLOCK_SIZE_N * SPLIT_N
     for n in range(0, tl.cdiv(N, LOAD_SIZE)):
         # squirrel5 noise function
@@ -352,6 +357,16 @@ def materialize_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
     
     accumulator = accumulator.to(dcoef_ptr.dtype.element_ty)
     tl.atomic_add(dcoef_ptr + offs_m, accumulator, mask=mask_m, sem="relaxed")
+
+if int(os.environ["AUTOTUNE"]): 
+    materialize_fwd_kernel = triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [32, 64, 256, 1024],
+                                                                        "BLOCK_SIZE_M": [8, 16, 32]}, None, None, num_warps=4),
+                                             key=['N', 'M'])(materialize_fwd_kernel)
+    materialize_bwd_kernel = triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [2**i for i in range(8, 11)],
+                                                                        "BLOCK_SIZE_M": [4, 16], "SPLIT_N": [4, 8, 16]}, None, None, num_warps=4, pre_hook=_zero_output_coef),
+                                             key=['N', 'M'])(materialize_bwd_kernel)
+else:
+    materialize_bwd_kernel.add_pre_run_hook(_zero_output_coef)
 
 @triton_op("rten::materialize_fwd", mutates_args={})
 def materialize_fwd(coefs: torch.Tensor, size: list[int], strides: list[int], seed: int, scale_bias: torch.Tensor, fused_bias: bool) -> torch.Tensor:
@@ -376,9 +391,11 @@ def materialize_bwd(dout: torch.Tensor, dcoefs_size: int, seed: int) -> torch.Te
 
 # seperate backward pass to compute the grad for the scale_bias if it is used
 def _zero_output_scale_bias(*args, **kwargs):
-	args[0]["dbias_ptr"].zero_()
+    if isinstance(args[0], dict): 
+        args[0]["dbias_ptr"].zero_()
+    else:
+        args[0].zero_()
  
-@triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [2**i for i in range(8, 11)]}, None, None, num_warps=4, pre_hook=_zero_output_scale_bias), key=["N"])
 @triton.jit
 def scale_bias_bwd_kernel(dbias_ptr, dout_ptr, N, seed, BLOCK_SIZE_N: tl.constexpr):
     pid = tl.program_id(0)
@@ -388,6 +405,11 @@ def scale_bias_bwd_kernel(dbias_ptr, dout_ptr, N, seed, BLOCK_SIZE_N: tl.constex
     accumulator = tl.sum(dout * squirrel5_gen_1d(offs, seed))
     accumulator = accumulator.to(dbias_ptr.dtype.element_ty)
     tl.atomic_add(dbias_ptr, accumulator, sem="relaxed")
+
+if int(os.environ["AUTOTUNE"]):
+    scale_bias_bwd_kernel = triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [2**i for i in range(8, 11)]}, None, None, num_warps=4, pre_hook=_zero_output_scale_bias), key=["N"])
+else:
+    scale_bias_bwd_kernel.add_pre_run_hook(_zero_output_scale_bias)
 
 @triton_op("rten::scale_bias_bwd", mutates_args={})
 def scale_bias_bwd(dout: torch.Tensor, seed: int) -> torch.Tensor:
@@ -424,6 +446,349 @@ def _mat_bwd(dout: torch.Tensor, dcoefs_size: int, seed: int):
 @scale_bias_bwd.register_kernel("cpu")
 def _scale_bias_bwd(dout: torch.Tensor, seed: int):
     raise NotImplementedError("Unsupported CPU implementation of scale_bias_bwd called.")
+
+
+def _zero_output_outptr(*args, **kwargs):
+    if isinstance(args[0], dict): 
+        args[0]["out_ptr"].zero_()
+    else:
+        args[0].zero_()
+
+@triton.jit
+def rt_mm_kernel(out_ptr,    # ptr to output vector
+                coef_ptr,  # ptr to the coefficients vector
+                m1_ptr, # ptr to the other other tensor mat1
+                M,   # size of the RT int dim
+                P, Q,	# size of the RT (P, Q)
+                L,	# size of the other tensor mat1 (Q, L)
+                stride_rt_P, stride_rt_Q, # strides of RT
+                stride_m1_L, stride_m1_P,	# strides of other tensor mat1
+                stride_out_L, stride_out_Q,
+                seed,   # seed for the generated tensor
+                #TODO: scale bias fused
+                scale_bias_ptr, RAND_BIAS: tl.constexpr,
+                BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_P: tl.constexpr, BLOCK_SIZE_Q: tl.constexpr, BLOCK_SIZE_L: tl.constexpr, SPLIT_L: tl.constexpr):
+    """
+    Fused kernel computing the matmul eqn: mat1 @ RT = out | (L, P) @ (P, Q) = (L, Q)
+    
+    The cost of materializing a column of the RT is the bitshift squirrel5 kernel and a dot product against a coef vector which should already be in L1. It should be confirmed and benched the perf of L1 materialization vs loading
+    an already materialized variant of the column from L2. 
+    Here we allocate certain pids to specific columns of the RT and maintain the pid persistently to keep the column in L1 cache, then load the required row from mat1. But this results in very bad mem access pattern?
+    Maybe each pid assigned to 1 col of RT, materialize it in L1, then load first row of mat1, then second row, sequentially, until run out of rows, then move onto the next block of columns and repeat per each row?
+    This would write consecutive indices of out matrix too, first row of out mat, then second row etc. for coalesced writes. This means that every pid at the same iterations would mem read the same row of mat1 and the
+    mem read would be broadcasted to all the L1 caches making it faster.
+    
+    In torch the usual memory format for tensors is row-major, which is slightly more inefficient when accessing elements for mat2 (hence some ops
+    pass in mat2.t() like linear layer). This is completely fine if mat2 is an RT, since in that case we can compute the output in row-major without
+    loading the whole mat2 in memory, instead of having to group-order the output, increasing chances for coalesced writes.
+    
+    For each elem in output C, we load the corresponding mat1 row (1,P) into SRAM, then compute the respective noise matrix for a column of B (P, M).
+    The noise matrix materialized via squirrel5_gen_2d requires offs_n, which is the indices of P modified by the strides.
+    Then run a dot product along P-dim against the coef vector (M,) to get a vector of the column B (P,) which we then dot product with mat1 row (1,P).
+    The two dot products can actually be fused, but might be more efficient to let compiler handle that.
+    
+    This approach even though optimized is still really bad, not faster, and doesn't scale better. DO NOT USE THIS, INSTEAD USE THE CUDA KERNEL (TO BE COMPLETED IN THE FUTURE).
+    """
+    # identifies consecutive part of the output vector we are writing to (can be across L-dim)
+    # different pids of L will regenerate the col, so there will be SPLIT_L number of times that the RT col is recomputed,
+    # which can further be split into BLOCK_SIZE_L for loop within a pid. But this is for future work, the idea is that rows in mat1
+    # remain in L2 cache and are not completely flushed. This should follow the grouped ordering in triton docs? Won't work because
+    # multiple warps/blocks will attempt to read the same row of mat1 at the same time, and broadcasts cannot be serialised to multiple
+    # warps. This is probably a big bottleneck. However we want to minimize the number of "reaccesses" to the RT
+    pid_q = tl.program_id(0)
+    pid_p = tl.program_id(1)
+    pid_l = tl.program_id(2)
+    # offs_l = pid_l * GROUP_SIZE_L + tl.arange(0, BLOCK_SIZE_L)
+    # mask_l = offs_l < L
+    offs_p = pid_p * BLOCK_SIZE_P + tl.arange(0, BLOCK_SIZE_P)
+    mask_p = offs_p < P
+    offs_q = pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+    # offs_q = tl.max_contiguous(tl.multiple_of(offs_q, BLOCK_SIZE_Q), BLOCK_SIZE_Q)
+    mask_q = offs_q < Q
+
+    col = tl.zeros([BLOCK_SIZE_P * BLOCK_SIZE_Q], dtype=tl.float32)
+    offs_n = tl.ravel(offs_p[:, None] * stride_rt_P + offs_q[None, :] * stride_rt_Q)	# (BLOCK_SIZE_P, BLOCK_SIZE_Q)
+    # squirrel5 noise function to generate a block of the column, that block being some consecutive BLOCK_SIZE_P values
+    # loop has to be unrolled otherwise for some reason it makes 1byte requests to L1 cache?
+    for m in tl.range(0, tl.cdiv(M, BLOCK_SIZE_M), loop_unroll_factor=2, flatten=True):
+        offs_m = m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        mangledBits = squirrel5_gen_2d(offs_m, offs_n, seed)    # (BLOCK_SIZE_P * BLOCK_SIZE_Q, BLOCK_SIZE_M)
+        coefs = tl.load(coef_ptr + offs_m, mask=offs_m < M, other=0.0)[None, :]    # (1, BLOCK_SIZE_M)
+        col += tl.sum(mangledBits * coefs, axis=1)  # (BLOCK_SIZE_P * BLOCK_SIZE_Q)
+    # offs_m = tl.arange(0, BLOCK_SIZE_M)
+    # mangledBits = squirrel5_gen_2d(offs_m, offs_n, seed)    # (BLOCK_SIZE_P * BLOCK_SIZE_Q, BLOCK_SIZE_M)
+    # # TODO: L2 local load pattern??? but coefs vector should be entirely small enough to fit into smem. maybe i guarantee it explicitly without this BLOCK_SIZE_M loop?
+    # coefs = tl.load(coef_ptr + offs_m, mask=offs_m < M, other=0.0)[None, :]    # (1, BLOCK_SIZE_M)
+    # col = tl.sum(mangledBits * coefs, axis=1)  # (BLOCK_SIZE_P * BLOCK_SIZE_Q)
+        
+    #TODO: i think there has to be masking for the col P,Q dims, but can't figure it out after reshape? might need tl.where
+    col = tl.where(mask_p[:, None] & mask_q[None, :], tl.reshape(col, (BLOCK_SIZE_P, BLOCK_SIZE_Q), can_reorder=False), 0.0)
+    # col = tl.reshape(col, (BLOCK_SIZE_P, BLOCK_SIZE_Q), can_reorder=False)
+    # col = tl.zeros([BLOCK_SIZE_P, BLOCK_SIZE_Q], dtype=tl.float32)
+        
+    #chunked
+    CHUNK_SIZE = L // SPLIT_L
+    offs_l = pid_l * CHUNK_SIZE + tl.arange(0, BLOCK_SIZE_L)
+    row_ptrs = m1_ptr + offs_l[:, None] * stride_m1_L + offs_p[None, :] * stride_m1_P
+    out_ptrs = out_ptr + offs_l[:, None] * stride_out_L + offs_q[None, :] * stride_out_Q
+    
+    for l in tl.range(0, tl.cdiv(CHUNK_SIZE, BLOCK_SIZE_L)):
+        mask_l = offs_l < CHUNK_SIZE*(SPLIT_L+1) - l * BLOCK_SIZE_L
+        row = tl.load(row_ptrs, mask=mask_l[:, None] & mask_p[None, :], other=0.0)
+        # row = tl.zeros([BLOCK_SIZE_L, BLOCK_SIZE_P], dtype=tl.float32)
+        dot_prod = tl.dot(row, col, allow_tf32=False)
+        # TODO: atomic add causing uncoalesced global accesses. blocksize32 causing 8x32bit mem accesses
+        # it seems relaxed is the lowest number of mem accesses at only 8. any other sem causes more.
+        # but it is not documented that atomics are unable to coalesce because of acq_rel semantics?
+        # by right a relaxed sem atomic add should allow coalesced writes.
+        # consider inline_asm_elementwise to brute force the coalesced atomic write?
+        # 4 element at a time fill up 128 byte with atomic red write ref: https://gist.github.com/bertmaher/e33b874f75cb82451060b88ee20b8203#file-fa-py-L301
+        # tl.atomic_add(out_ptrs, dot_prod, mask=mask_l[:, None] & mask_q[None, :], sem="relaxed")
+        # XD? if i tl.store the mem accesses are all coalesced into a single 128 byte transaction
+        # tl.store(out_ptrs, dot_prod, mask=mask_l[:, None] & mask_q[None, :])
+        
+        # i can only guess ncu is complaining because im too poorge to afford gpu with compute capability >sm_90 that supports vectorised atomics
+        # per https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#atomicadd
+        # so triton just compiles the atomics into uncoalesced packed instruction set... instead of interleaving the atomic adds for every thread inside a warp?
+        # my options are to:
+        # 1. accept that triton is inefficient and suck it up
+        # 2. write custom asm inline that implements interleaved atomic adds
+        
+        # mov.b32 $0, %tid.x;
+        # this accesses tid.x index and assigns it to =r output register $0
+        # probably also need %ntid.x?
+        # compute some form of offset and interleaving with that
+        _ = tl.inline_asm_elementwise(
+            """
+            red.global.relaxed.add.f32 [$4], $8;
+            red.global.relaxed.add.f32 [$5], $9;
+            red.global.relaxed.add.f32 [$6], $10;
+            red.global.relaxed.add.f32 [$7], $11;
+            """,
+            (
+                # 4 dummy output registers
+                "=r,=r,=r,=r,"
+                # outptr registers
+                "l,l,l,l,"
+                # dot product registers
+                "r,r,r,r"
+            ),
+            args=[
+                out_ptrs.to(tl.uint64),
+                dot_prod.to(tl.float32),
+            ],
+            dtype=tl.uint32,
+            is_pure=False,
+            pack=4,
+        )
+        
+        row_ptrs += BLOCK_SIZE_L * stride_m1_L
+        out_ptrs += BLOCK_SIZE_L * stride_out_L
+    
+    ########################################################
+    #interleaved 
+    """
+    # multiply the BLOCK_SIZE_P col values with corresponding BLOCK_SIZE_P row values along the same P offset
+    offs_l = pid_l * BLOCK_SIZE_L + tl.arange(0, BLOCK_SIZE_L)
+    # offs_l = tl.max_contiguous(tl.multiple_of(offs_l, BLOCK_SIZE_L), BLOCK_SIZE_L)
+    row_ptrs = m1_ptr + offs_l[:, None] * stride_m1_L + offs_p[None, :] * stride_m1_P
+    out_ptrs = out_ptr + offs_l[:, None] * stride_out_L + offs_q[None, :] * stride_out_Q
+    # out_ptrs = out_ptr + offs_l[:, None] * Q + offs_q[None, :]
+    # it seems that global memory loads are not broadcasted to different warps if they all request the same row
+    #TODO: the loading scheme for rows seems to be uncoalesced? 1 byte per sector used 
+    # row = tl.load(row_ptrs, mask=mask_l[:, None] & mask_p[None, :], other=0.0)	# (BLOCK_SIZE_L, BLOCK_SIZE_P)
+    
+    # mask_out = mask_l[:, None] & mask_q[None, :]
+    # dot_prod = tl.dot(row, col, allow_tf32=False)
+    # # if allow_tf32 is True the fp32xfp32 dot product will be pretty significantly numerically different from correct values: https://github.com/triton-lang/triton/issues/4574
+    # tl.atomic_add(out_ptrs, dot_prod, mask=mask_out, sem="relaxed")
+    # interleaved. but idk why this helps at all, the interleave is across row 
+    # acc = tl.zeros(BLOCK_SIZE_L * SPLIT_L, BLOCK_SIZE_Q)
+    for l in range(0, tl.cdiv(L, BLOCK_SIZE_L*SPLIT_L)):
+        # mask_l = offs_l < GROUP_SIZE_L - l * BLOCK_SIZE_L
+        mask_l = offs_l < L - l * BLOCK_SIZE_L*SPLIT_L
+        # it seems that global memory loads are not broadcasted to different warps if they all request the same row
+        #TODO: the loading scheme for rows seems to be uncoalesced? 1 byte per sector used 
+        row = tl.load(row_ptrs, mask=mask_l[:, None] & mask_p[None, :], other=0.0)	# (BLOCK_SIZE_L, BLOCK_SIZE_P)
+        
+        mask_out = mask_l[:, None] & mask_q[None, :]
+        dot_prod = tl.dot(row, col, allow_tf32=False)
+        # if allow_tf32 is True the fp32xfp32 dot product will be pretty significantly numerically different from correct values: https://github.com/triton-lang/triton/issues/4574
+        tl.atomic_add(out_ptrs, dot_prod, mask=mask_out, sem="relaxed")
+        # advance to the next row
+        row_ptrs += BLOCK_SIZE_L * SPLIT_L * stride_m1_L
+        # out_ptrs += BLOCK_SIZE_L * SPLIT_L * stride_out_L
+        out_ptrs += BLOCK_SIZE_L * SPLIT_L * Q
+    """
+    
+if int(os.environ["AUTOTUNE"]):
+    rt_mm_kernel = triton.autotune(configs=construct_configs({"BLOCK_SIZE_M": [32],
+                                                              "BLOCK_SIZE_P": [32],
+                                                              "BLOCK_SIZE_Q": [32],
+                                                              "BLOCK_SIZE_L": [32],
+                                                              "SPLIT_L": [4]}, None, None, num_warps=4, pre_hook=_zero_output_outptr),
+                                   key=['M', 'P', 'Q', 'L'])(rt_mm_kernel)
+else:
+    rt_mm_kernel.add_pre_run_hook(_zero_output_outptr)
+
+def rt_mm(mat1: torch.Tensor, coefs: torch.Tensor, size: list[int], strides: list[int], seed: int, scale_bias: torch.Tensor, fused_bias: bool) -> torch.Tensor:
+    M = coefs.size(0)
+    P, Q = size
+    L = mat1.size(0)
+    assert mat1.size(1) == P, f"mm shape mismatch, received mat1 shape {mat1.size()} and rt shape {size}"
+    assert not (fused_bias and scale_bias is None), "scale_bias not initialized but fused_bias is True"
+    output = torch.empty(size=(L, Q), device=coefs.device)
+    grid = lambda meta: ( triton.cdiv(Q, meta['BLOCK_SIZE_Q']), triton.cdiv(P, meta['BLOCK_SIZE_P']), meta['SPLIT_L'] )
+    # print(f"strides {*strides, *mat1.stride(), *output.stride()}")
+    # print(f"input args {output, coefs, mat1, M, P, Q, L, *strides, *mat1.stride(), *output.stride(), seed, scale_bias, int(fused_bias)}")
+    rt_mm_kernel[grid](output, coefs, mat1, M, P, Q, L, *strides, *mat1.stride(), *output.stride(), seed, scale_bias, int(fused_bias))
+    return output
+
+
+@triton.jit
+def rt_mm_grouped_kernel(out_ptr,    # ptr to output vector
+                coef_ptr,  # ptr to the coefficients vector
+                m1_ptr, # ptr to the other other tensor mat1
+                buffer_ptr, # ptr to a buffer vector that is (GROUP_SIZE * BLOCK_SIZE_L, BLOCK_SIZE_Q)
+                M,   # size of the RT int dim
+                P, Q,	# size of the RT (P, Q)
+                L,	# size of the other tensor mat1 (Q, L)
+                stride_rt_P, stride_rt_Q, # strides of RT
+                stride_m1_L, stride_m1_P,	# strides of other tensor mat1
+                stride_out_L, stride_out_Q,
+                seed,   # seed for the generated tensor
+                #TODO: scale bias fused
+                scale_bias_ptr, RAND_BIAS: tl.constexpr,
+                BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_P: tl.constexpr, BLOCK_SIZE_Q: tl.constexpr, BLOCK_SIZE_L: tl.constexpr, GROUP_SIZE: tl.constexpr):
+    """
+    Fused kernel computing the matmul eqn: mat1 @ RT = out | (L, P) @ (P, Q) = (L, Q)
+    
+    This one where we explicitly maintain a buffer_ptr vector that is used to tl.store() intermediate representations of RT that is computed. SHOULD be in L2, slightly slower than compared to full materialization? But this is
+    an issue with triton, where we cannot explicitly manage the memory layout and cannot materialize buffer vector in shared memory.
+    
+    The cost of materializing a column of the RT is the bitshift squirrel5 kernel and a dot product against a coef vector which should already be in L1. It should be confirmed and benched the perf of L1 materialization vs loading
+    an already materialized variant of the column from L2. 
+    Here we allocate certain pids to specific columns of the RT and maintain the pid persistently to keep the column in L1 cache, then load the required row from mat1. But this results in very bad mem access pattern?
+    Maybe each pid assigned to 1 col of RT, materialize it in L1, then load first row of mat1, then second row, sequentially, until run out of rows, then move onto the next block of columns and repeat per each row?
+    This would write consecutive indices of out matrix too, first row of out mat, then second row etc. for coalesced writes. This means that every pid at the same iterations would mem read the same row of mat1 and the
+    mem read would be broadcasted to all the L1 caches making it faster.
+    
+    In torch the usual memory format for tensors is row-major, which is slightly more inefficient when accessing elements for mat2 (hence some ops
+    pass in mat2.t() like linear layer). This is completely fine if mat2 is an RT, since in that case we can compute the output in row-major without
+    loading the whole mat2 in memory, instead of having to group-order the output, increasing chances for coalesced writes.
+    
+    For each elem in output C, we load the corresponding mat1 row (1,P) into SRAM, then compute the respective noise matrix for a column of B (P, M).
+    The noise matrix materialized via squirrel5_gen_2d requires offs_n, which is the indices of P modified by the strides.
+    Then run a dot product along P-dim against the coef vector (M,) to get a vector of the column B (P,) which we then dot product with mat1 row (1,P).
+    The two dot products can actually be fused, but might be more efficient to let compiler handle that.
+    """
+    # identifies consecutive part of the output vector we are writing to (can be across L-dim)
+    # different pids of L will regenerate the col, so there will be SPLIT_L number of times that the RT col is recomputed,
+    # which can further be split into BLOCK_SIZE_L for loop within a pid. But this is for future work, the idea is that rows in mat1
+    # remain in L2 cache and are not completely flushed. This should follow the grouped ordering in triton docs? Won't work because
+    # multiple warps/blocks will attempt to read the same row of mat1 at the same time, and broadcasts cannot be serialised to multiple
+    # warps. This is probably a big bottleneck. However we want to minimize the number of "reaccesses" to the RT
+    pid_l, pid_q = tl.program_id(0), tl.program_id(1)
+    num_pid_l, num_pid_q = tl.num_programs(0), tl.num_programs(1)
+    # pid_l, pid_q = tl.swizzle2d(pid_l, pid_q, num_pid_l, num_pid_q, GROUP_SIZE)
+    pid_q, pid_l = tl.swizzle2d(pid_q, pid_l, num_pid_q, num_pid_l, GROUP_SIZE)
+    offs_l = pid_l * BLOCK_SIZE_L + tl.arange(0, BLOCK_SIZE_L)
+    mask_l = offs_l < L
+    offs_q = pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+    mask_q = offs_q < Q
+    
+    # split along P dim
+    pid_p = tl.program_id(2)
+    offs_p = pid_p * BLOCK_SIZE_P + tl.arange(0, BLOCK_SIZE_P)
+    mask_p = offs_p < P
+    
+    col = tl.zeros([BLOCK_SIZE_P * BLOCK_SIZE_Q], dtype=tl.float32)
+    offs_n = tl.ravel(offs_p[:, None] * stride_rt_P + offs_q[None, :] * stride_rt_Q)	# (BLOCK_SIZE_P, BLOCK_SIZE_Q)
+    # squirrel5 noise function to generate a block of the column, that block being some consecutive BLOCK_SIZE_P values
+    for m in range(0, tl.cdiv(M, BLOCK_SIZE_M)):
+        offs_m = m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        mangledBits = squirrel5_gen_2d(offs_m, offs_n, seed)    # (BLOCK_SIZE_P * BLOCK_SIZE_Q, BLOCK_SIZE_M)
+        coefs = tl.load(coef_ptr + offs_m, mask=offs_m < M, other=0.0)[None, :]    # (1, BLOCK_SIZE_M)
+        col += tl.sum(mangledBits * coefs, axis=1)  # (BLOCK_SIZE_P * BLOCK_SIZE_Q)
+    #TODO: i think there has to be masking for the col P,Q dims, but can't figure it out after reshape? might need tl.where
+    col = tl.where(mask_p[:, None] & mask_q[None, :], tl.reshape(col, (BLOCK_SIZE_P, BLOCK_SIZE_Q), can_reorder=False), 0.0)
+    # col = tl.reshape(col, (BLOCK_SIZE_P, BLOCK_SIZE_Q), can_reorder=False)
+    
+    # multiply the BLOCK_SIZE_P col values with corresponding BLOCK_SIZE_P row values along the same P offset
+    offs_l = pid_l * BLOCK_SIZE_L + tl.arange(0, BLOCK_SIZE_L)
+    offs_l = tl.max_contiguous(tl.multiple_of(offs_l, BLOCK_SIZE_L), BLOCK_SIZE_L)
+    row_ptrs = m1_ptr + offs_l[:, None] * stride_m1_L + offs_p[None, :] * stride_m1_P
+    out_ptrs = out_ptr + offs_l[:, None] * stride_out_L + offs_q[None, :] * stride_out_Q
+    # it seems that global memory loads are not broadcasted to different warps if they all request the same row
+    #TODO: the loading scheme for rows seems to be uncoalesced? 1 byte per sector used 
+    row = tl.load(row_ptrs, mask=mask_l[:, None] & mask_p[None, :], other=0.0)	# (BLOCK_SIZE_L, BLOCK_SIZE_P)
+    dot_prod = tl.dot(row, col, allow_tf32=False)
+    mask_out = mask_l[:, None] & mask_q[None, :]
+    tl.atomic_add(out_ptrs, dot_prod, mask=mask_out, sem="relaxed")
+    # mask_out = mask_l[:, None] & mask_q[None, :]
+    # dot_prod = tl.dot(row, col, allow_tf32=False)
+    # # if allow_tf32 is True the fp32xfp32 dot product will be pretty significantly numerically different from correct values: https://github.com/triton-lang/triton/issues/4574
+    # tl.atomic_add(out_ptrs, dot_prod, mask=mask_out, sem="relaxed")
+    # interleaved. but idk why this helps at all, the interleave is across row 
+    # acc = tl.zeros(BLOCK_SIZE_L * SPLIT_L, BLOCK_SIZE_Q)
+    # for l in range(0, tl.cdiv(L, BLOCK_SIZE_L*SPLIT_L)):
+    #     # mask_l = offs_l < GROUP_SIZE_L - l * BLOCK_SIZE_L
+    #     mask_l = offs_l < L - l * BLOCK_SIZE_L*SPLIT_L
+    #     # it seems that global memory loads are not broadcasted to different warps if they all request the same row
+    #     #TODO: the loading scheme for rows seems to be uncoalesced? 1 byte per sector used 
+    #     row = tl.load(row_ptrs, mask=mask_l[:, None] & mask_p[None, :], other=0.0)	# (BLOCK_SIZE_L, BLOCK_SIZE_P)
+        
+    #     mask_out = mask_l[:, None] & mask_q[None, :]
+    #     # if allow_tf32 is True the fp32xfp32 dot product will be pretty significantly numerically different from correct values: https://github.com/triton-lang/triton/issues/4574
+    #     tl.atomic_add(out_ptrs, dot_prod, mask=mask_out, sem="relaxed")
+    #     # advance to the next row
+    #     row_ptrs += BLOCK_SIZE_L * SPLIT_L * stride_m1_L
+    #     out_ptrs += BLOCK_SIZE_L * SPLIT_L * stride_out_L
+    
+if int(os.environ["AUTOTUNE"]):
+    rt_mm_grouped_kernel = triton.autotune(configs=construct_configs({"BLOCK_SIZE_M": [32],
+                                                "BLOCK_SIZE_P": [32, 64],
+                                                "BLOCK_SIZE_Q": [32, 64],
+                                                "BLOCK_SIZE_L": [32, 64],
+                                                "GROUP_SIZE": [2, 3, 4]}, None, None, num_warps=4, pre_hook=_zero_output_outptr),
+                                           key=['M', 'P', 'Q', 'L'])(rt_mm_grouped_kernel)
+else:
+    rt_mm_grouped_kernel.add_pre_run_hook(_zero_output_outptr)
+
+def rt_mm_grouped(mat1: torch.Tensor, coefs: torch.Tensor, size: list[int], strides: list[int], seed: int, scale_bias: torch.Tensor, fused_bias: bool) -> torch.Tensor:
+    M = coefs.size(0)
+    P, Q = size
+    L = mat1.size(0)
+    assert mat1.size(1) == P, f"mm shape mismatch, received mat1 shape {mat1.size()} and rt shape {size}"
+    assert not (fused_bias and scale_bias is None), "scale_bias not initialized but fused_bias is True"
+    output = torch.empty(size=(L, Q), device=coefs.device)
+    grid = lambda meta: ( triton.cdiv(L, meta['BLOCK_SIZE_L']), triton.cdiv(Q, meta['BLOCK_SIZE_Q']), triton.cdiv(P, meta['BLOCK_SIZE_P']) )
+    print(f"strides {*strides, *mat1.stride(), *output.stride()}")
+    # print(f"input args {output, coefs, mat1, M, P, Q, L, *strides, *mat1.stride(), *output.stride(), seed, scale_bias, int(fused_bias)}")
+    rt_mm_grouped_kernel[grid](output, coefs, mat1, M, P, Q, L, *strides, *mat1.stride(), *output.stride(), seed, scale_bias, int(fused_bias))
+    return output
+
+class fakeMMFunction(Function):
+    """
+    - func: mm(Tensor self, Tensor mat2) -> Tensor
+    Intermediate wrapper function while I debug the fused matmul kernel.
+    """
+    @staticmethod
+    def forward(ctx, self: torch.Tensor, mat2: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(self, mat2)
+        # print(f"fakeMM fwd called on {self} {mat2}")
+        return self @ mat2
+
+    @staticmethod
+    def backward(ctx, grad):
+        self, mat2 = ctx.saved_tensors
+        print(f"fakeMM bwd called on {self} {mat2} with grad {grad}")
+        dself = grad @ mat2.t()
+        dmat2 = grad @ self.t()
+        return dself, dmat2
+
+def fakeMM(mat1: torch.Tensor, mat2: torch.Tensor) -> torch.Tensor:
+    return fakeMMFunction.apply(mat1, mat2)
 
 
 class RandumbTensor(torch.Tensor):
@@ -574,6 +939,11 @@ class RandumbTensor(torch.Tensor):
                 rt = RandumbTensor(instance._coef, instance.seed, fake.shape, instance.scale_bias, instance.fused_bias, fake.stride())
                 del fake
             return rt
+        elif func is torch.ops.aten.mm.default:
+            # print("RT detected aten.mm op, overriding with custom mm args")
+            # print(args)
+            # unwrap, because after this is called, inside fakeMM it again calls a matmul, which would otherwise redispatch here, and cause an infinite loop
+            ret = fakeMM(*tree_map(_materialize, args), **tree_map(_materialize, kwargs))
         else:
             ret = func(*tree_map(_materialize, args), **tree_map(_materialize, kwargs))
             
@@ -610,6 +980,7 @@ class RandumbTensorConstructor(Function):
     def backward(ctx, grad):
         # flatten the grad back to same shape as materialize bwd output
         # .flatten() instead of .view() as no guarantee the bwd tensor is contiguous
+        print("RT constructor bwd called")
         grad = grad.flatten()
         # run the actual bwd
         dcoefs = materialize_bwd(grad, ctx.dcoefs_size, ctx.seed).to(ctx.dtype)
@@ -624,10 +995,6 @@ def CreateRandumbTensor(coefs: torch.Tensor, seed: int, shape: Iterable, scale_b
 
 
 # triton kernel implementation for the embedding layer
-@triton.autotune(configs=construct_configs({"BLOCK_SIZE_ROW": [256, 1024],
-                                            "BLOCK_SIZE_M": [16, 64], 
-                                            "BLOCK_SIZE_IDX": [16, 64]}, None, None, num_warps=4), 
-                 key=['rowsize', 'M', 'idx_size'])
 @triton.jit
 def embed_fwd_kernel(out_ptr,   # ptr to output vector
                 coef_ptr,   # ptr to the coefficients vector
@@ -689,10 +1056,6 @@ def embed_fwd_kernel(out_ptr,   # ptr to output vector
     mask = (offs_idx < idx_size * rowsize) & (offs_row < rowsize)
     tl.store(out_ptrs, accumulator, mask=mask)
 
-@triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [32, 128, 1024], 
-                                            "BLOCK_SIZE_M": [8, 16, 32], 
-                                            "SPLIT_N": [4, 8, 16]}, None, None, num_warps=4, pre_hook=_zero_output_coef), 
-                 key=['rowsize', 'M', 'idx_size'])
 @triton.jit
 def embed_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
                 dout_ptr,  # ptr to the dout vector
@@ -744,6 +1107,17 @@ def embed_bwd_kernel(dcoef_ptr,    # ptr to dcoef vector
     accumulator = accumulator.to(dcoef_ptr.dtype.element_ty)
     tl.atomic_add(dcoef_ptr + offs_m, accumulator, mask=mask_m, sem="relaxed")
 
+if int(os.environ["AUTOTUNE"]):
+    embed_fwd_kernel = triton.autotune(configs=construct_configs({"BLOCK_SIZE_ROW": [256, 1024], 
+                                                                  "BLOCK_SIZE_M": [16, 64],  
+                                                                  "BLOCK_SIZE_IDX": [16, 64]}, None, None, num_warps=4), 
+                                       key=['rowsize', 'M', 'idx_size'])(embed_fwd_kernel)
+    embed_bwd_kernel = triton.autotune(configs=construct_configs({"BLOCK_SIZE_N": [32, 128, 1024], "BLOCK_SIZE_M": [8, 16, 32], "SPLIT_N": [4, 8, 16]},
+                                                                 None, None, num_warps=4, pre_hook=_zero_output_coef), 
+                                       key=['rowsize', 'M', 'idx_size'])(embed_bwd_kernel)
+else:
+    embed_bwd_kernel.add_pre_run_hook(_zero_output_coef)
+
 @triton_op("rten::embed_fwd", mutates_args={})
 def embed_fwd(idx: torch.Tensor, coefs: torch.Tensor, rowsize: int, seed: int) -> torch.Tensor:
     output = torch.empty(size=(*idx.shape, rowsize), device=coefs.device)
@@ -781,79 +1155,3 @@ def _embed_fwd(idx: torch.Tensor, coefs: torch.Tensor, rowsize: int, seed: int):
 @embed_bwd.register_kernel("cpu")
 def _embed_bwd(dout: torch.Tensor, dcoefs_size: int, seed: int):
     raise NotImplementedError("Unsupported CPU implementation of embed_bwd called.")
-
-
-if __name__ == "__main__":    
-    torch.manual_seed(0)
-    DEVICE = "cuda" 
-    seed = 1337
-    output_shape = (5, 10)
-    w1 = nn.Parameter(torch.randn(7, device=DEVICE), requires_grad=True)
-    w2 = torch.randn((2, 3), requires_grad=False, device=DEVICE)
-
-    # Autograd doesn't "unwrap" variables, they still remember if they
-    # requires_grad; and in fact, inside __torch_dispatch__ it is willing
-    # to mix gradients between multiple levels. The current class does
-    # catch most of these though when it is looking at the different
-    # arguments
-    print("creating RT with view transpose")
-    x = CreateRandumbTensor(w1, seed, output_shape).view(2, 25).transpose(0, 1)
-    print("created RT with view transpose")
-    print(f"x {x.requires_grad} {x} {x.view_ops}")
-    """
-    print(f"x {x}")
-    print(f"viewops {x.view_ops}")
-    
-    y1 = torch.zeros(5, 10, device=DEVICE)
-    print(x.add(y1))
-    
-    x2 = x.view(10, 5)
-    print(f"x2 {x2}")
-    print(f"viewops {x2.view_ops}")
-    
-    y2 = torch.zeros(10, 5, device=DEVICE)
-    print(x2.add(y2))
-    
-    x3 = x2.transpose(0, 1)
-    print(f"x3 {x3}")
-    z = x3.add(y1)
-    print(f"z {z}")
-    
-    print("--------------")
-    print("getting backwards graph of z.gradfn")
-    getBack(z.grad_fn)
-    print(f"x requires grad {x.requires_grad}")
-    print(f"x2 requires grad {x2.requires_grad}")
-    """
-    
-    print("performing backward")
-    # there are two different behaviours here. if the w2 is of a normal tensor, the grads are not backpropagated
-    # to the inner tensors of the tensor subclass.
-    # but if w2 is of InnerAutogradTensor then the gradients are properly backpropagated?
-    for i in range(10):
-        print(f"innerautograd backward {i}")
-        y = x @ w2
-        loss = y.sum()
-        loss.backward(retain_graph=True)
-    print(w1.grad)
-    print("x inner grads", x._coef.grad)
-    
-    print("--------------")
-    print("getting backwards graph of y.gradfn")
-    getBack(y.grad_fn)
-    
-    print("--------real values---------")
-    true_coef = w1.detach().clone().to(DEVICE)
-    true_coef.requires_grad_()
-    n, m = torch.Size(output_shape).numel(), true_coef.size(0)
-    true_noise_mat = squirrel5_generate_2d(n, m, seed)
-
-    true_rt = (true_noise_mat @ true_coef).view(output_shape).view(2, 25).transpose(0, 1)
-    print(f"checking truert equal rt {torch.allclose(x, true_rt)}")
-    true_w2 = w2.detach().clone()
-    for i in range(10):
-        print(f"true backward {i}")
-        y = true_rt @ true_w2
-        y.sum().backward(retain_graph=True)
-    
-    print(f"true coef grad {true_coef.grad}")

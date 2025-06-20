@@ -75,7 +75,10 @@ class CausalSelfAttention(nn.Module):
         v = (1 - self.lamb) * v + self.lamb * vi.view_as(v) # @Grad62304977
         q, k = norm(q), norm(k) # QK norm suggested by @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, kernel_options={
+                "BLOCK_M": 32, "BLOCK_N": 32,  # forward
+                "BLOCK_M1": 16, "BLOCK_N1": 32, "BLOCK_M2": 32, "BLOCK_N2": 16  # backwards
+            })
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
@@ -151,6 +154,7 @@ class GPT(nn.Module):
         block_mask = create_block_mask(document_causal_mask, None, None, S, S, device="cuda", _compile=True)
 
         # forward the GPT model itself
+        # print(f"input to wte idx shape {idx[None].shape}")
         x = self.transformer.wte(idx[None]) # token embeddings of shape (b, t, n_embd)
         x = norm(x) # @Grad62304977
         x0 = x
@@ -300,7 +304,8 @@ class RT_GPT(nn.Module):
             wte = SillyEmbedding(config.vocab_size, config.n_embd, config.int_dim_gen, config.seed_gen),
             # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual learning
             vte = SillyEmbedding(config.vocab_size, config.n_embd*12, config.int_dim_gen, config.seed_gen),
-            h = nn.ModuleList([RT_Block(config) for _ in range(config.n_layer)]),
+            # h = nn.ModuleList([RT_Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         self.lm_head = RT_CastedLinear(config.n_embd, config.vocab_size, config)
         # self.lm_head.weight.data.zero_() # @Grad62304977

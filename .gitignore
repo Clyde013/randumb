@@ -3,6 +3,9 @@ __pycache__
 wandb
 logs
 *.pickle
+build
+*.egg-info
+.vscode
 
 bench_out/
 dists/

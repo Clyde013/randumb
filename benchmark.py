@@ -17,10 +17,10 @@ from torch.profiler import profile, record_function, ProfilerActivity
 import triton
 import triton.language as tl
 
-from src.RandumbTensor import CreateRandumbTensor, squirrel5_generate, materialize_fwd, materialize_bwd
-from src.SillyLayers import SillyLinear
+from rten_cpp.RandumbTensor import CreateRandumbTensor, squirrel5_generate_2d, materialize_fwd, materialize_bwd, rt_mm
+from rten_cpp.SillyLayers import SillyLinear
 
-from utils import _test_memory
+from rten_cpp.utils import _test_memory
 
 DEVICE = "cuda"
 @torch.compile
@@ -34,6 +34,7 @@ def torch_rand_compiled(coeffs, size, m):
         x_names=['size'],  # Argument names to use as an x-axis for the plot.
         x_vals=[2**i for i in range(12, 23, 1)],  # Different possible values for `size`.
         x_log=True,  # x axis is logarithmic.
+        y_log=True,
         line_arg='provider',  # Argument name whose value corresponds to a different line in the plot.
         line_vals=['torch_rand', 'torch_rand_compiled', 'materialize'],  # Possible values for `line_arg`.
         line_names=['torch_rand', 'torch_rand_compiled', 'materialize'],  # Label name for the lines.
@@ -47,11 +48,12 @@ def benchmark_speed_materialize(size, provider):
     Benchmarks the materialization speed of the tensor vs a naive torch implementation and simple torch.compile one.
     """
     quantiles = [0.5, 0.2, 0.8]
-    m = 512
+    m = round(size * 0.01)
     coefs = torch.randn(m, device=DEVICE, dtype=torch.float32)
+    scale_bias = torch.tensor([1], device=DEVICE, dtype=torch.float32)
     
     def materialize_test():
-        return materialize_fwd(coefs, size, seed=1337)
+        return materialize_fwd(coefs, size, 1337, scale_bias, True)
     
     def torch_rand():
         noise_mat = torch.randn((size, m), device=DEVICE)
@@ -62,7 +64,10 @@ def benchmark_speed_materialize(size, provider):
         return torch_rand_compiled(coefs, size, m)
     
     if provider == 'torch_rand':
-        ms, min_ms, max_ms = triton.testing.do_bench(torch_rand, quantiles=quantiles)
+        if size > 2**19:
+            ms, min_ms, max_ms = None, None, None
+        else:
+            ms, min_ms, max_ms = triton.testing.do_bench(torch_rand, quantiles=quantiles)
         
     if provider == 'torch_rand_compiled':
         ms, min_ms, max_ms = triton.testing.do_bench(torch_rand_compiled_wrapper, quantiles=quantiles)
@@ -90,9 +95,10 @@ def benchmark_mem_materialize(size, provider):
     quantiles = [0.5, 0.2, 0.8]
     m = 2048
     coefs = torch.randn(m, device=DEVICE, dtype=torch.float32)
+    scale_bias = torch.tensor([1], device=DEVICE, dtype=torch.float32)
     
     def materialize_test():
-        return materialize_fwd(coefs, size, seed=1337)
+        return materialize_fwd(coefs, size, 1337, scale_bias, True)
     
     def torch_rand():
         noise_mat = torch.randn((size, m), device=DEVICE)
@@ -129,7 +135,7 @@ def check_func():
     coefs = torch.randn(m, device=DEVICE, dtype=torch.float32)
     true_coefs = coefs.detach().clone()
     true_coefs.requires_grad = True
-    t = materialize_fwd(coefs, n, seed=1337)
+    t = materialize_fwd(coefs, n, seed=1337, scale_bias=None, fused_bias=False)
     print("materialized matrix:")
     print(t)
     y = t.cpu().detach().numpy()
@@ -137,7 +143,7 @@ def check_func():
     # check the output is actually matching what it is expected to be
     true_noise_mat = torch.zeros((n, m), device=DEVICE)
     for row in range(n):
-        row_vals = squirrel5_generate(row, size=m, BLOCK_SIZE=256, seed=1337)
+        row_vals = squirrel5_generate_2d(row, size=m, BLOCK_SIZE=256, seed=1337)
         true_noise_mat[row] = row_vals
     true_out = true_noise_mat @ true_coefs    
     print(f"dist between calculated and true: {torch.dist(true_out, t)}")
@@ -184,17 +190,71 @@ def check_func():
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['size'],  # Argument names to use as an x-axis for the plot.
-        x_vals=[2**i for i in range(2, 17, 1)],  # Different possible values for `size`.
+        x_vals=[2**i for i in range(6, 20, 1)],  # Different possible values for `size`.
         x_log=True,  # x axis is logarithmic.
         line_arg='provider',  # Argument name whose value corresponds to a different line in the plot.
-        line_vals=['torch', 'rt', 'torch_view', 'rt_view'],  # Possible values for `line_arg`.
-        line_names=['torch', 'rt', 'torch_view', 'rt_view'],  # Label name for the lines.
-        styles=[('green', '-'), ('blue', '-'), ('red', '-'), ('purple', '-')],  # Line styles.
+        line_vals=['torch', 'rt', 'rt_fused'],  # Possible values for `line_arg`.
+        line_names=['torch', 'rt', 'rt_fused'],  # Label name for the lines.
+        styles=[('green', '-'), ('blue', '-'), ('red', '-')],  # Line styles.
         ylabel='ms',  # Label name for the y-axis.
         plot_name='torch vs RT speed performance',  # Name for the plot. Used also as a file name for saving the plot.
         args={},  # Values for function arguments not in `x_names` and `y_name`.
     ))
 def benchmark_speed_rt(size, provider):
+    """
+    Benchmarks the speed of tensor operations with a RandumbTensor vs normal tensors.
+    size is .numel() of the rt, so the noise matrix is (size, m) shaped
+    `m` being the intermediate dimension of the rt.
+    """
+    quantiles = [0.5, 0.2, 0.8]
+    m = round(size * 0.01)
+    x_shape = (int(size//(size**0.5)), int(size**0.5))
+    print(f"benching m {m} size {size} shape {x_shape}")
+    
+    rt_coef = torch.randn(m, requires_grad=True, device=DEVICE)
+    rt = CreateRandumbTensor(rt_coef, 1337, x_shape, None, False)
+    
+    t = torch.randn(x_shape, device=DEVICE)
+    mat1 = torch.randn(x_shape, device=DEVICE).T
+    
+    def rt_impl():
+        mat1 @ rt
+        return
+    
+    def rt_fused_impl():
+        rt_mm(mat1, rt._coef, rt.size(), rt.stride(), rt.seed, rt.scale_bias, rt.fused_bias)
+        return
+    
+    def torch_impl():
+        mat1 @ t
+        return
+    
+    if provider == 'torch':
+        ms, min_ms, max_ms = triton.testing.do_bench(torch_impl, quantiles=quantiles)
+        
+    if provider == 'rt_fused':
+        ms, min_ms, max_ms = triton.testing.do_bench(rt_fused_impl, quantiles=quantiles)
+        
+    if provider == 'rt':
+        ms, min_ms, max_ms = triton.testing.do_bench(rt_impl, quantiles=quantiles)
+    
+    return ms, max_ms, min_ms
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=['size'],  # Argument names to use as an x-axis for the plot.
+        x_vals=[2**i for i in range(4, 17, 1)],  # Different possible values for `size`.
+        x_log=True,  # x axis is logarithmic.
+        line_arg='provider',  # Argument name whose value corresponds to a different line in the plot.
+        line_vals=['torch_view', 'rt_view'],  # Possible values for `line_arg`.
+        line_names=['torch_view', 'rt_view'],  # Label name for the lines.
+        styles=[('green', '-'), ('blue', '-'), ('red', '-'), ('purple', '-')],  # Line styles.
+        ylabel='ms',  # Label name for the y-axis.
+        plot_name='torch vs RT viewops speed performance',  # Name for the plot. Used also as a file name for saving the plot.
+        args={},  # Values for function arguments not in `x_names` and `y_name`.
+    ))
+def benchmark_speed_rt_viewops(size, provider):
     """
     Benchmarks the speed of tensor operations with a RandumbTensor vs normal tensors.
     `m` being the intermediate dimension of the rt.
@@ -316,7 +376,7 @@ def benchmark_speed_bwd(size, provider):
     dcoefs_size, seed = 256, 1337
     dout = torch.ones((size,), dtype=torch.float32, device="cuda")
     
-    noise_mat = squirrel5_generate(size, dcoefs_size, seed)
+    noise_mat = squirrel5_generate_2d(size, dcoefs_size, seed)
     
     def torch_impl():
         noise_mat.T @ dout
@@ -535,10 +595,10 @@ if __name__ == "__main__":
     
     # benchmarks the speed and memory consumption
     # benchmark_mem_materialize.run(print_data=True, show_plots=True, save_path='bench_out')
-    benchmark_speed_materialize.run(print_data=True, show_plots=True, save_path='bench_out')
+    # benchmark_speed_materialize.run(print_data=True, show_plots=True, save_path='bench_out')
     benchmark_speed_rt.run(print_data=True, show_plots=True, save_path='bench_out')
-    benchmark_speed_bwd.run(print_data=True, show_plots=True, save_path='bench_out')
+    # benchmark_speed_bwd.run(print_data=True, show_plots=True, save_path='bench_out')
 
     # check_train_loop()
-    plot_dist()
+    # plot_dist()
     

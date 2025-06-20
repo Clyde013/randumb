@@ -172,8 +172,6 @@ def main():
     use_mps = not args.no_mps and torch.backends.mps.is_available()
 
     torch.manual_seed(args.seed)
-    
-    #TODO: normal model but with random tensors fully initialized, freeze only the noise matrices. see initial loss and training dynamics should be the same.
     training_args = {"is_rand_model": True, "int_dim_offs": 128, "int_dim_step": 0, "seed_offs": 5, "seed_step": 4}
     
     if args.wandb:

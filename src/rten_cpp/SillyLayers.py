@@ -15,7 +15,7 @@ from torch import Generator
 
 from torch.nn.common_types import _size_2_t
 
-from src.RandumbTensor import CreateRandumbTensor, RandumbTensor, embed_fwd
+from .RandumbTensor import CreateRandumbTensor, RandumbTensor, embed_fwd
 
 
 

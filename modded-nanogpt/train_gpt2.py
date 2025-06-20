@@ -222,7 +222,7 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-    wandb_integration : bool = True # enable logging to wandb
+    wandb_integration : bool = False # enable logging to wandb
     single_gpu_training: bool = True # modifies batch_size and seq_len to fit on single 4090
     normal_model: bool = False # whether its a normal or random model
     # seed generator params
@@ -250,8 +250,8 @@ if args.single_gpu_training:
     # ref: https://github.com/KellerJordan/modded-nanogpt/pull/38 to support 4090 training
     # per https://github.com/KellerJordan/modded-nanogpt/pull/38#issuecomment-2571392240
     # we halve the sequence length and double the batch size
-    args.batch_size = args.batch_size * 8
-    args.sequence_length = args.sequence_length // 8
+    args.batch_size = args.batch_size * 4
+    args.sequence_length = args.sequence_length // 4
     print(f"single gpu training active, adjusting batch size to {args.batch_size} and seq len to {args.sequence_length}")
     
     

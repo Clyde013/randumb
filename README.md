@@ -1,13 +1,12 @@
 # RANDUMB: Mostly Random Neural Networks
 
-<b>How random can a model be?</b>
+<b>Inspired by the biological human model of how decisions early on in life can determine the downward trajectory of your future, you too can similarly determine the downward trajectory of your model's loss with the initial seed.</b>
 
-This repo is home to an extremely dumb attempt at incorporating random projections into neural network training to create the silliest architecture possible - a *mostly* random one.
+This is *not a serious project challenging SoTA*, this method is entirely luck based and should only ever be ironically used by the insane.
 
 While traditional neural network pretraining techniques may optimize every parameter available in the model, what if we kept a subset of those parameters *completely random*? 
 The next logical conclusion of course is that if a large subset of the model were to be completely random, we could simply compress that into a seed and generate the values on the fly (beacuse why not?).
-The obvious benefits of this approach would be runtime memory efficiency, as the random tensors would only ever require materialization as necessary - you could in theory utilize a rather *ludicrously* large random matrix without ever needing to store any of those numbers in GPU VRAM, especially if fused with further matrix operations.
-Not to mention the final model could be represented with a single seed and a much smaller number of the trainable parameters.
+The obvious benefits of this approach would be runtime memory efficiency, as the random tensors would only ever require materialization as necessary - you could in theory utilize a rather *ludicrously* large random matrix without ever needing to store any of those numbers in GPU VRAM, especially if fused with further matrix operations. Viewed from the perspective of quantization aware training, the final model could be represented with a single seed and a much smaller number of the trainable parameters.
 
 While there has been similar work in the past combining random projections and neural networks, most of the implementations utilize custom hardware (i.e. FPGA, Graphcore IPUs), which obviously aren't widely available. 
 This repo implements a custom triton Pseudorandom Matrix-Vector Product kernel utilizing the [Squirrel5 PRNG Noise Function](https://twitter.com/SquirrelTweets/status/1421251894274625536) in order to efficiently represent and materialize custom tensors:
@@ -33,6 +32,9 @@ Hence, $\text{var}(y)=\frac{3}{d_y}std^2$ where $d_y$ is the coef dim.
 This repo uses triton==3.2.0 and pytorch>=2.6.0 for `torch.library.triton_op` support. Install with:
 
 `pip3 install --pre torch==2.6.0.dev20250104+cu124 torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu124`
+
+Since we have custom C++/CUDA bindings under `src/rten_cpp/csrc`, we use compile it using torch.utils.cpp_extension ahead of time with setuptools.
+Just run `pip install .` at the root directory to install the package as rten_cpp.
 
 Anything else install as you find import errors pop up :)
 
